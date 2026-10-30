@@ -1,14 +1,21 @@
 package com.example
 
 import android.content.Context
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.example.ai.AiReplyConfig
+import com.example.crash.CrashReportManager
+import com.example.data.StudioPreferencesRepository
 import com.example.engine.AdBlockerEngine
 import com.example.engine.UniversalVideoResolver
 import com.example.engine.isLikelyVideoStreamUrl
+import com.example.model.StudioUiState
 import com.example.service.LiveCommentBus
+import java.io.File
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -89,5 +96,63 @@ class ExampleRobolectricTest {
         assertTrue(prompt.contains("You are a sarcastic, witty, funny live-stream character."))
         assertTrue(prompt.contains("@karim_99: Why do you always miss that jump?"))
         assertTrue(prompt.contains("Reply in the same language and dialect as the comment."))
+    }
+
+    @Test
+    fun `character video copies into filesDir switches repeatedly restores last video and falls back if missing`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = StudioPreferencesRepository(context)
+
+        // Simulate switching character video 5 times in a row from external source files
+        var previousSavedPath: String? = null
+        repeat(5) { idx ->
+            val externalSource = File(context.cacheDir, "picker_temp_$idx.mp4").apply {
+                writeBytes("fake-mp4-video-payload-$idx".toByteArray())
+            }
+            val result = repo.copyCharacterVideoToInternalStorage(Uri.fromFile(externalSource))
+            assertTrue(result.isSuccess)
+            val copiedPath = result.getOrThrow()
+
+            // Must be stored inside filesDir/character_videos and never reuse temporary picker URI
+            assertTrue(copiedPath.startsWith(context.filesDir.absolutePath))
+            assertTrue(repo.isValidCharacterVideoFile(copiedPath))
+            if (previousSavedPath != null) {
+                assertNotEquals(previousSavedPath, copiedPath)
+                // Previous file still exists until deferred cleanup runs after player stops
+                assertTrue(File(previousSavedPath!!).exists())
+            }
+
+            repo.saveState(StudioUiState(characterLocalPath = copiedPath))
+            repo.cleanupOldCharacterVideos(activePathToKeep = copiedPath)
+
+            if (previousSavedPath != null) {
+                assertFalse(File(previousSavedPath!!).exists())
+            }
+            previousSavedPath = copiedPath
+            externalSource.delete()
+        }
+
+        // Verify app restart restores the last selected character video from filesDir
+        val restored = repo.loadInitialState()
+        assertEquals(previousSavedPath, restored.characterLocalPath)
+
+        // Delete the saved file and verify restart falls back cleanly to default null state without crashing
+        File(previousSavedPath!!).delete()
+        val restoredAfterMissing = repo.loadInitialState()
+        assertNull(restoredAfterMissing.characterLocalPath)
+    }
+
+    @Test
+    fun `crash report manager reads and clears saved stack trace file`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val crashFile = File(context.filesDir, "last_crash_report.txt")
+        crashFile.writeText("java.lang.RuntimeException: Test crash stack trace")
+
+        val loaded = CrashReportManager.readPendingCrashReport(context)
+        assertNotNull(loaded)
+        assertTrue(loaded!!.contains("Test crash stack trace"))
+
+        CrashReportManager.clearCrashReport(context)
+        assertNull(CrashReportManager.readPendingCrashReport(context))
     }
 }

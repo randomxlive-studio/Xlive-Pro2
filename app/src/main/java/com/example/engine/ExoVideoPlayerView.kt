@@ -5,6 +5,7 @@ import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.view.TextureView
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -41,6 +42,7 @@ import com.example.model.VideoQualityPreference
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
 
@@ -158,7 +160,7 @@ fun ExoVideoPlayerView(
                     .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
                     .build()
             }
-        }
+        }.setEnableDecoderFallback(true)
 
         ExoPlayer.Builder(context, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
@@ -172,6 +174,8 @@ fun ExoVideoPlayerView(
             }
     }
 
+    val isPlayerReleased = remember(exoPlayer) { AtomicBoolean(false) }
+
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -183,46 +187,80 @@ fun ExoVideoPlayerView(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                currentOnError?.invoke(error.errorCodeName)
+                val callback = currentOnError
+                if (callback != null) {
+                    callback.invoke(error.errorCodeName)
+                } else {
+                    runCatching {
+                        Toast.makeText(
+                            context,
+                            "Video error: ${error.errorCodeName}",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
             }
         }
         exoPlayer.addListener(listener)
         onDispose {
-            exoPlayer.removeListener(listener)
-            exoPlayer.clearVideoTextureView(textureViewRef)
-            exoPlayer.release()
+            if (isPlayerReleased.compareAndSet(false, true)) {
+                runCatching { exoPlayer.removeListener(listener) }
+                runCatching { exoPlayer.stop() }
+                runCatching { exoPlayer.clearMediaItems() }
+                runCatching { exoPlayer.clearVideoTextureView(textureViewRef) }
+                runCatching { exoPlayer.release() }
+            }
         }
     }
 
     LaunchedEffect(trackSelector, qualityPreference) {
-        trackSelector.setParameters(buildMin720pTrackParameters(trackSelector, qualityPreference))
+        runCatching {
+            trackSelector.setParameters(buildMin720pTrackParameters(trackSelector, qualityPreference))
+        }
     }
 
     LaunchedEffect(exoPlayer, sourceUriOrUrl, reloadNonce) {
-        if (sourceUriOrUrl.isBlank()) {
+        if (isPlayerReleased.get()) return@LaunchedEffect
+        runCatching {
+            if (sourceUriOrUrl.isBlank()) {
+                exoPlayer.stop()
+                exoPlayer.clearMediaItems()
+                return@LaunchedEffect
+            }
+            val uri = if (sourceUriOrUrl.startsWith("/")) {
+                val f = File(sourceUriOrUrl)
+                if (!f.exists() || f.length() <= 0L) {
+                    exoPlayer.stop()
+                    exoPlayer.clearMediaItems()
+                    return@LaunchedEffect
+                }
+                Uri.fromFile(f)
+            } else {
+                Uri.parse(sourceUriOrUrl)
+            }
             exoPlayer.stop()
             exoPlayer.clearMediaItems()
-            return@LaunchedEffect
+            exoPlayer.setMediaItem(MediaItem.fromUri(uri))
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = isPlaying
         }
-        val uri = if (sourceUriOrUrl.startsWith("/")) {
-            Uri.fromFile(File(sourceUriOrUrl))
-        } else {
-            Uri.parse(sourceUriOrUrl)
-        }
-        exoPlayer.setMediaItem(MediaItem.fromUri(uri))
-        exoPlayer.prepare()
-        exoPlayer.playWhenReady = isPlaying
     }
 
     LaunchedEffect(exoPlayer, isPlaying) {
-        exoPlayer.playWhenReady = isPlaying
-        if (isPlaying && exoPlayer.playbackState == Player.STATE_IDLE && exoPlayer.mediaItemCount > 0) {
-            exoPlayer.prepare()
+        if (isPlayerReleased.get()) return@LaunchedEffect
+        runCatching {
+            exoPlayer.playWhenReady = isPlaying
+            if (isPlaying && exoPlayer.playbackState == Player.STATE_IDLE && exoPlayer.mediaItemCount > 0) {
+                exoPlayer.prepare()
+            }
         }
     }
 
     LaunchedEffect(exoPlayer, isMuted, isAudioDucked) {
-        exoPlayer.volume = computeTargetVolume(isMuted = isMuted, isAudioDucked = isAudioDucked)
+        if (isPlayerReleased.get()) return@LaunchedEffect
+        runCatching {
+            exoPlayer.volume = computeTargetVolume(isMuted = isMuted, isAudioDucked = isAudioDucked)
+        }
     }
 
     LaunchedEffect(voiceReduceEnabled) {

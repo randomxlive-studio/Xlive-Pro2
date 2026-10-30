@@ -68,12 +68,14 @@ fun DraggableStudioWindow(
 
     val sizeAndAppearanceModifier = when {
         isCircular -> {
-            // Perfect circle: no corners, no border, no stroke, no shadow
+            // Perfect circle: no corners, no border, no stroke, no shadow, clipped at hardware layer
             Modifier
                 .size(circleDiameterDp)
                 .graphicsLayer {
                     scaleX = pulseScale
                     scaleY = pulseScale
+                    shape = CircleShape
+                    clip = true
                 }
                 .clip(CircleShape)
                 .background(Color.Transparent, CircleShape)

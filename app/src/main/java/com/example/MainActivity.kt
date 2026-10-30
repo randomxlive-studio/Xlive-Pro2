@@ -17,6 +17,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.crash.CrashReportManager
 import com.example.ui.StudioScreen
 import com.example.ui.StudioViewModel
 import com.example.ui.theme.MyApplicationTheme
@@ -26,6 +27,7 @@ class MainActivity : ComponentActivity() {
     private val viewModel: StudioViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        runCatching { CrashReportManager.install(applicationContext) }
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Keep the screen awake automatically for uninterrupted streaming/broadcasting
@@ -63,22 +65,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIncomingShareIntent(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_SEND) return
-        val type = intent.type.orEmpty()
-        if (type == "text/plain") {
-            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
-            if (sharedText.isNotBlank()) {
-                viewModel.handleSharedText(sharedText)
-            }
-        } else if (type.startsWith("video/")) {
-            val videoUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(Intent.EXTRA_STREAM)
-            }
-            if (videoUri != null) {
-                viewModel.handlePickedGameplayVideo(videoUri)
+        runCatching {
+            if (intent?.action != Intent.ACTION_SEND) return
+            val type = intent.type.orEmpty()
+            if (type == "text/plain") {
+                val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
+                if (sharedText.isNotBlank()) {
+                    viewModel.handleSharedText(sharedText)
+                }
+            } else if (type.startsWith("video/")) {
+                val videoUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+                if (videoUri != null) {
+                    viewModel.handlePickedGameplayVideo(videoUri)
+                }
             }
         }
     }

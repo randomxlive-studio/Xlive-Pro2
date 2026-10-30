@@ -164,9 +164,10 @@ data class StudioUiState(
     val isManualCoverOn: Boolean = false,
     val isVoiceReduceOn: Boolean = false,
 
-    // Circular Character & Camera settings
+    // Circular Character & Camera settings (VIDEO or CAMERA only — no images)
     val characterLocalPath: String? = null,
-    val isCharacterImage: Boolean = false,
+    val characterVideoSwitchNonce: Long = 0L,
+    val isCharacterVideoSwitching: Boolean = false,
     val isCameraActive: Boolean = false,
     val isFrontCamera: Boolean = true,
     val isCharacterPlaying: Boolean = true,
@@ -193,12 +194,13 @@ data class StudioUiState(
     val dailyAiRequestCount: Int = 0,
     val isAiSpeaking: Boolean = false,
 
-    // Studio UI state
+    // Studio UI state & Crash Reporter
     val isBroadcastMode: Boolean = false,
     val isPanelMinimized: Boolean = false,
     val isBrowserSheetOpen: Boolean = false,
     val statusBannerMessage: String? = null,
-    val isStatusSuccess: Boolean = true
+    val isStatusSuccess: Boolean = true,
+    val pendingCrashReport: String? = null
 ) {
     val isCoverVisible: Boolean
         get() = isManualCoverOn || (isAutoHideAdsOn && isAdDetectedNow)

@@ -13,7 +13,7 @@
     <string name="gameplay_empty_title">Gameplay &amp; Video Window</string>
     <string name="gameplay_empty_subtitle">Paste a link from any platform, upload a video, or open the built-in browser</string>
     <string name="character_empty_title">Circle</string>
-    <string name="character_empty_subtitle">Image / Cam</string>
+    <string name="character_empty_subtitle">Video / Cam</string>
 
     <!-- Panel Top Bar -->
     <string name="btn_broadcast_short">Broadcast</string>
@@ -82,15 +82,20 @@
     <string name="ratio_portrait">Portrait 9:16</string>
     <string name="ratio_free">Free</string>
 
-    <!-- Circular Character & Camera -->
-    <string name="section_character">CIRCULAR CHARACTER / CAMERA</string>
-    <string name="btn_upload_character">Upload image/video</string>
-    <string name="btn_camera_on">Camera on: tap for media</string>
+    <!-- Circular Character & Camera (Video or Camera Only) -->
+    <string name="section_character">CIRCULAR CHARACTER (VIDEO / CAMERA)</string>
+    <string name="btn_upload_character">Select video</string>
+    <string name="btn_change_character_video">Change video</string>
+    <string name="btn_camera_on">Camera on: tap for video</string>
     <string name="btn_camera_off">Use camera</string>
     <string name="btn_camera_flip">Flip camera</string>
     <string name="btn_pulse_on">AI Speech Pulse: ON</string>
     <string name="btn_pulse_off">AI Speech Pulse: OFF</string>
     <string name="camera_permission_denied">Please allow camera permission to use live camera in the character circle.</string>
+    <string name="character_video_error_toast">Video playback error: %1$s</string>
+    <string name="character_video_copy_failed">Could not load selected video: %1$s</string>
+    <string name="character_video_missing_restored_default">Previous character video was missing; restored default circle.</string>
+    <string name="character_camera_error_toast">Camera error: %1$s</string>
 
     <!-- TikTok LIVE Reader & Sarcastic AI Voice -->
     <string name="section_tiktok_ai">TIKTOK LIVE READER &amp; SARCASTIC AI VOICE (AUDIO ONLY)</string>
@@ -156,4 +161,11 @@
     <string name="status_saved_local">Saved on this device</string>
     <string name="status_invalid_url">Please enter a valid link starting with https:// or search keywords</string>
     <string name="status_clipboard_empty">Clipboard is empty</string>
+
+    <!-- Crash Report Dialog -->
+    <string name="crash_dialog_title">Previous Crash Log</string>
+    <string name="crash_dialog_subtitle">An unexpected error occurred during the previous session. Copy the stack trace below to inspect or share it.</string>
+    <string name="btn_copy_crash">Copy Stack Trace</string>
+    <string name="btn_dismiss_crash">Clear &amp; Close</string>
+    <string name="toast_crash_copied">Crash stack trace copied to clipboard</string>
 </resources>

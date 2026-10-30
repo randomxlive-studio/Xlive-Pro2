@@ -3,8 +3,10 @@ package com.example.ui
 import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -81,7 +83,8 @@ import com.example.model.DisplayScaleMode
 import com.example.model.PlaybackEngineMode
 import com.example.model.SniffedStream
 import com.example.model.StudioUiState
-import com.example.ui.components.CameraCharacterView
+import com.example.ui.components.CharacterCircleMediaView
+import com.example.ui.components.CrashReportDialog
 import com.example.ui.components.DraggableStudioWindow
 import com.example.ui.components.PlatformBrowserSheet
 import com.example.ui.components.StudioControlPanel
@@ -89,7 +92,6 @@ import com.example.ui.components.TikTokAiSetupDialog
 import com.example.ui.theme.LivePulseRed
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.NeonEmerald
-import com.example.ui.theme.NeonPink
 import com.example.ui.theme.NeonPurple
 import com.example.ui.theme.SpaceGroteskFamily
 import com.example.ui.theme.StudioDeepNavy
@@ -112,23 +114,85 @@ fun StudioScreen(
         viewModel.setBroadcastMode(false)
     }
 
-    // Zero-permission Android Photo Pickers for Avatar, Gameplay video, and Character image/video
+    // Zero-permission Android Photo Pickers for Header Avatar, Gameplay video, and Character video (VideoOnly)
     val avatarPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
-        if (uri != null) viewModel.handlePickedAvatarImage(uri)
+        if (uri != null) {
+            runCatching { viewModel.handlePickedAvatarImage(uri) }
+        }
     }
 
     val gameplayVideoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
-        if (uri != null) viewModel.handlePickedGameplayVideo(uri)
+        if (uri != null) {
+            runCatching { viewModel.handlePickedGameplayVideo(uri) }
+        }
     }
 
-    val characterMediaPicker = rememberLauncherForActivityResult(
+    val characterVideoDocumentFallback = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Throwable) {
+                }
+                viewModel.handlePickedCharacterVideo(uri)
+            } catch (t: Throwable) {
+                val msg = context.getString(
+                    R.string.character_video_copy_failed,
+                    t.localizedMessage ?: t.javaClass.simpleName
+                )
+                runCatching { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    val characterVideoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
-        if (uri != null) viewModel.handlePickedCharacterMedia(uri)
+        if (uri != null) {
+            try {
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Throwable) {
+                }
+                viewModel.handlePickedCharacterVideo(uri)
+            } catch (t: Throwable) {
+                val msg = context.getString(
+                    R.string.character_video_copy_failed,
+                    t.localizedMessage ?: t.javaClass.simpleName
+                )
+                runCatching { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    fun launchCharacterVideoPickerSafely() {
+        try {
+            characterVideoPicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+            )
+        } catch (_: Throwable) {
+            try {
+                characterVideoDocumentFallback.launch(arrayOf("video/*"))
+            } catch (t: Throwable) {
+                val msg = context.getString(
+                    R.string.character_video_copy_failed,
+                    t.localizedMessage ?: t.javaClass.simpleName
+                )
+                runCatching { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+            }
+        }
     }
 
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
@@ -282,7 +346,20 @@ fun StudioScreen(
                     viewModel.updateCharacterRect(rect, isLandscape, save)
                 }
             ) {
-                CharacterMediaContent(state = state)
+                CharacterCircleMediaView(
+                    isCameraActive = state.isCameraActive,
+                    isFrontCamera = state.isFrontCamera,
+                    videoFilePath = state.characterLocalPath,
+                    videoSwitchNonce = state.characterVideoSwitchNonce,
+                    isPlaying = state.isCharacterPlaying,
+                    isMuted = !state.isCharacterSoundOn,
+                    isLoadingVideo = state.isCharacterVideoSwitching,
+                    isBroadcastMode = state.isBroadcastMode,
+                    onVideoPlaybackError = viewModel::onCharacterVideoPlaybackError,
+                    onMissingVideoFile = viewModel::onCharacterVideoFileMissing,
+                    onCameraFailure = viewModel::onCharacterCameraError,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
 
@@ -379,23 +456,21 @@ fun StudioScreen(
                 onToggleVoiceReduce = viewModel::toggleVoiceReduce,
                 onSelectScaleMode = viewModel::setDisplayScaleMode,
                 onSelectAspectPreset = viewModel::setAspectPreset,
-                onPickCharacterMedia = {
-                    characterMediaPicker.launch(
-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                    )
-                },
+                onPickCharacterVideo = { launchCharacterVideoPickerSafely() },
                 onToggleCamera = {
-                    if (state.isCameraActive) {
-                        viewModel.setCameraActive(false)
-                    } else {
-                        val hasPerm = ContextCompat.checkSelfPermission(
-                            context,
-                            Manifest.permission.CAMERA
-                        ) == PackageManager.PERMISSION_GRANTED
-                        if (hasPerm) {
-                            viewModel.setCameraActive(true)
+                    runCatching {
+                        if (state.isCameraActive) {
+                            viewModel.setCameraActive(false)
                         } else {
-                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                            val hasPerm = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.CAMERA
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (hasPerm) {
+                                viewModel.setCameraActive(true)
+                            } else {
+                                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
                         }
                     }
                 },
@@ -471,6 +546,15 @@ fun StudioScreen(
                 isOcrFallbackRunning = state.isOcrFallbackRunning,
                 onToggleOcrFallback = { toggleOcrFallbackWithConsent() },
                 onDismiss = { viewModel.setSetupGuideOpen(false) }
+            )
+        }
+
+        // Next-Launch Global Crash Report Dialog (with Copy button)
+        val crashLog = state.pendingCrashReport
+        if (!crashLog.isNullOrBlank()) {
+            CrashReportDialog(
+                crashReport = crashLog,
+                onDismissAndClear = viewModel::dismissCrashReport
             )
         }
     }
@@ -620,74 +704,6 @@ private fun GameplayMediaContent(
                     color = NeonCyan,
                     textAlign = TextAlign.Center
                 )
-            }
-        }
-    }
-}
-
-@Composable
-private fun CharacterMediaContent(state: StudioUiState) {
-    Box(modifier = Modifier.fillMaxSize()) {
-        when {
-            state.isCameraActive -> {
-                CameraCharacterView(
-                    isFrontCamera = state.isFrontCamera,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-
-            !state.characterLocalPath.isNullOrBlank() && state.isCharacterImage -> {
-                AsyncImage(
-                    model = File(state.characterLocalPath),
-                    contentDescription = stringResource(R.string.cd_profile_avatar),
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-
-            !state.characterLocalPath.isNullOrBlank() -> {
-                ExoVideoPlayerView(
-                    sourceUriOrUrl = state.characterLocalPath,
-                    headers = emptyMap(),
-                    isPlaying = state.isCharacterPlaying,
-                    isMuted = !state.isCharacterSoundOn,
-                    voiceReduceEnabled = false,
-                    scaleMode = DisplayScaleMode.FILL,
-                    reloadNonce = 0,
-                    qualityPreference = state.qualityPreference,
-                    isAudioDucked = false,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-
-            !state.isBroadcastMode -> {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(StudioDeepNavy.copy(alpha = 0.55f))
-                        .padding(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Person,
-                        contentDescription = null,
-                        tint = NeonPink,
-                        modifier = Modifier.size(24.dp)
-                    )
-                    Text(
-                        text = stringResource(R.string.character_empty_title),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = NeonEmerald,
-                        textAlign = TextAlign.Center
-                    )
-                    Text(
-                        text = stringResource(R.string.character_empty_subtitle),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = StudioTextSecondary,
-                        textAlign = TextAlign.Center
-                    )
-                }
             }
         }
     }

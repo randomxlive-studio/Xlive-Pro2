@@ -3,6 +3,7 @@ package com.example.ui
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,6 +12,7 @@ import com.example.ai.AiReplyConfig
 import com.example.ai.AiReplyResult
 import com.example.ai.SarcasticAiResponder
 import com.example.ai.TtsVoiceManager
+import com.example.crash.CrashReportManager
 import com.example.data.StudioPreferencesRepository
 import com.example.engine.UniversalVideoResolver
 import com.example.model.DetectedPlatform
@@ -27,6 +29,7 @@ import com.example.model.WindowRectState
 import com.example.service.LiveCommentBus
 import com.example.service.TikTokOcrFallbackService
 import com.example.ui.components.isAccessibilityServiceEnabledInSettings
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,6 +38,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class StudioViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -50,21 +55,39 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private var bannerJob: Job? = null
     private var previewVoiceJob: Job? = null
 
+    private val characterSwitchMutex = Mutex()
+
+    @Volatile
+    private var isInitialStateLoaded: Boolean = false
+
     @Volatile
     private var isSilentlyPausedForRateLimit: Boolean = false
 
     init {
         viewModelScope.launch {
-            val saved = repo.loadInitialState()
+            val saved = runCatching { repo.loadInitialState() }.getOrElse { StudioUiState() }
+            val crashLog = runCatching {
+                CrashReportManager.readPendingCrashReport(application)
+            }.getOrNull()
+
             LiveCommentBus.ownUsernameLower = saved.accountName.lowercase()
-            _uiState.update {
+            _uiState.update { current ->
                 saved.copy(
+                    // If user picked a video while startup was finishing, preserve the newer pick
+                    characterLocalPath = current.characterLocalPath ?: saved.characterLocalPath,
+                    characterVideoSwitchNonce = maxOf(
+                        current.characterVideoSwitchNonce,
+                        saved.characterVideoSwitchNonce
+                    ),
                     availableTtsVoices = ttsVoiceManager.availableVoices.value,
                     isAccessibilityServiceConnected = LiveCommentBus.isAccessibilityConnected.value ||
                         isAccessibilityServiceEnabledInSettings(application),
-                    isOcrFallbackRunning = LiveCommentBus.isOcrFallbackRunning.value
+                    isOcrFallbackRunning = LiveCommentBus.isOcrFallbackRunning.value,
+                    pendingCrashReport = crashLog
                 )
             }
+            isInitialStateLoaded = true
+
             if (saved.activeUrl.isNotBlank()) {
                 loadVideoLink(saved.activeUrl, keepCurrentEngine = true)
             }
@@ -174,9 +197,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun persistCurrentState() {
+        if (!isInitialStateLoaded) return
         val snapshot = _uiState.value
         viewModelScope.launch {
             repo.saveState(snapshot)
+        }
+    }
+
+    fun dismissCrashReport() {
+        _uiState.update { it.copy(pendingCrashReport = null) }
+        viewModelScope.launch {
+            CrashReportManager.clearCrashReport(getApplication())
         }
     }
 
@@ -268,54 +299,187 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun handlePickedGameplayVideo(uri: Uri) {
         viewModelScope.launch {
-            val saved = repo.copyPickedMediaToInternalStorage(uri, "gameplay")
-            if (saved != null) {
-                val (savedPath, _) = saved
-                _uiState.update {
-                    it.copy(
-                        gameplayLocalPath = savedPath,
-                        activeUrl = "",
-                        urlInput = "",
-                        resolvedTarget = null,
-                        sniffedStreams = emptyList(),
-                        selectedSniffedStream = null,
-                        isGameplayPlaying = true,
-                        playerReloadNonce = it.playerReloadNonce + 1
-                    )
+            runCatching {
+                val saved = repo.copyPickedMediaToInternalStorage(uri, "gameplay")
+                if (saved != null) {
+                    val (savedPath, _) = saved
+                    _uiState.update {
+                        it.copy(
+                            gameplayLocalPath = savedPath,
+                            activeUrl = "",
+                            urlInput = "",
+                            resolvedTarget = null,
+                            sniffedStreams = emptyList(),
+                            selectedSniffedStream = null,
+                            isGameplayPlaying = true,
+                            playerReloadNonce = it.playerReloadNonce + 1
+                        )
+                    }
+                    persistCurrentState()
+                    showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
+                    delay(1200L)
+                    repo.cleanupOldSlotMedia("gameplay", savedPath)
                 }
-                persistCurrentState()
-                showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
             }
         }
     }
 
-    fun handlePickedCharacterMedia(uri: Uri) {
+    /**
+     * Safe character video change flow:
+     * 1. Takes persistable URI permission where applicable.
+     * 2. Stops Camera / releases current video player cleanly before switching.
+     * 3. Copies the picked video stream into internal `filesDir/character_videos` on `Dispatchers.IO`.
+     * 4. Plays exclusively from the `filesDir` copy and cleans up older copies after switching.
+     */
+    fun handlePickedCharacterVideo(uri: Uri) {
+        val app = getApplication<Application>()
+        try {
+            repo.tryTakePersistableReadPermission(uri)
+        } catch (_: Throwable) {
+        }
+
         viewModelScope.launch {
-            val saved = repo.copyPickedMediaToInternalStorage(uri, "character")
-            if (saved != null) {
-                val (savedPath, isImage) = saved
-                _uiState.update {
-                    it.copy(
-                        characterLocalPath = savedPath,
-                        isCharacterImage = isImage,
-                        isCameraActive = false,
-                        isCharacterPlaying = true
-                    )
+            characterSwitchMutex.withLock {
+                val previousValidPath = _uiState.value.characterLocalPath
+                    ?.takeIf { repo.isValidCharacterVideoFile(it) }
+
+                try {
+                    // Tear down active Camera or previous ExoPlayer first before loading the new video
+                    _uiState.update {
+                        it.copy(
+                            isCameraActive = false,
+                            isCharacterVideoSwitching = true
+                        )
+                    }
+
+                    val copyResult = repo.copyCharacterVideoToInternalStorage(uri)
+                    val savedPath = copyResult.getOrNull()
+
+                    if (!savedPath.isNullOrBlank() && repo.isValidCharacterVideoFile(savedPath)) {
+                        _uiState.update {
+                            it.copy(
+                                characterLocalPath = savedPath,
+                                characterVideoSwitchNonce = it.characterVideoSwitchNonce + 1L,
+                                isCharacterVideoSwitching = false,
+                                isCameraActive = false,
+                                isCharacterPlaying = true
+                            )
+                        }
+                        if (isInitialStateLoaded) {
+                            repo.saveState(_uiState.value)
+                        }
+                        showStatus(app.getString(R.string.status_saved_local), true)
+
+                        // Clean up previous copied character videos safely after old player released
+                        viewModelScope.launch(Dispatchers.IO) {
+                            delay(1500L)
+                            repo.cleanupOldCharacterVideos(
+                                activePathToKeep = _uiState.value.characterLocalPath
+                            )
+                        }
+                    } else {
+                        val reason = copyResult.exceptionOrNull()?.localizedMessage
+                            ?: "Unsupported video"
+                        _uiState.update {
+                            it.copy(
+                                characterLocalPath = previousValidPath,
+                                characterVideoSwitchNonce = if (previousValidPath != null) {
+                                    it.characterVideoSwitchNonce + 1L
+                                } else {
+                                    it.characterVideoSwitchNonce
+                                },
+                                isCharacterVideoSwitching = false,
+                                isCameraActive = false
+                            )
+                        }
+                        val errMsg = app.getString(R.string.character_video_copy_failed, reason)
+                        runCatching {
+                            Toast.makeText(app, errMsg, Toast.LENGTH_LONG).show()
+                        }
+                        showStatus(errMsg, false)
+                    }
+                } catch (t: Throwable) {
+                    val reason = t.localizedMessage ?: t.javaClass.simpleName
+                    _uiState.update {
+                        it.copy(
+                            characterLocalPath = previousValidPath,
+                            isCharacterVideoSwitching = false,
+                            isCameraActive = false
+                        )
+                    }
+                    val errMsg = app.getString(R.string.character_video_copy_failed, reason)
+                    runCatching {
+                        Toast.makeText(app, errMsg, Toast.LENGTH_LONG).show()
+                    }
+                    showStatus(errMsg, false)
                 }
-                persistCurrentState()
-                showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
             }
+        }
+    }
+
+    fun onCharacterVideoPlaybackError(errorDetail: String) {
+        val app = getApplication<Application>()
+        runCatching {
+            _uiState.update {
+                it.copy(
+                    characterLocalPath = null,
+                    isCharacterVideoSwitching = false,
+                    isCameraActive = false
+                )
+            }
+            persistCurrentState()
+            viewModelScope.launch(Dispatchers.IO) {
+                delay(500L)
+                repo.cleanupOldCharacterVideos(activePathToKeep = null)
+            }
+            showStatus(
+                app.getString(R.string.character_video_error_toast, errorDetail),
+                false
+            )
+        }
+    }
+
+    fun onCharacterVideoFileMissing() {
+        val app = getApplication<Application>()
+        runCatching {
+            _uiState.update {
+                it.copy(
+                    characterLocalPath = null,
+                    isCharacterVideoSwitching = false,
+                    isCameraActive = false
+                )
+            }
+            persistCurrentState()
+            showStatus(
+                app.getString(R.string.character_video_missing_restored_default),
+                false
+            )
+        }
+    }
+
+    fun onCharacterCameraError(errorDetail: String) {
+        val app = getApplication<Application>()
+        runCatching {
+            _uiState.update { it.copy(isCameraActive = false) }
+            showStatus(
+                app.getString(R.string.character_camera_error_toast, errorDetail),
+                false
+            )
         }
     }
 
     fun handlePickedAvatarImage(uri: Uri) {
         viewModelScope.launch {
-            val saved = repo.copyPickedMediaToInternalStorage(uri, "avatar")
-            if (saved != null) {
-                val (savedPath, _) = saved
-                _uiState.update { it.copy(avatarLocalPath = savedPath) }
-                persistCurrentState()
-                showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
+            runCatching {
+                val saved = repo.copyPickedMediaToInternalStorage(uri, "avatar")
+                if (saved != null) {
+                    val (savedPath, _) = saved
+                    _uiState.update { it.copy(avatarLocalPath = savedPath) }
+                    persistCurrentState()
+                    showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
+                    delay(1000L)
+                    repo.cleanupOldSlotMedia("avatar", savedPath)
+                }
             }
         }
     }
@@ -587,7 +751,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setCameraActive(active: Boolean) {
-        _uiState.update { it.copy(isCameraActive = active) }
+        runCatching {
+            _uiState.update { prev ->
+                val validSavedVideo = prev.characterLocalPath
+                    ?.takeIf { repo.isValidCharacterVideoFile(it) }
+                prev.copy(
+                    isCameraActive = active,
+                    isCharacterVideoSwitching = false,
+                    characterLocalPath = validSavedVideo,
+                    characterVideoSwitchNonce = if (!active && validSavedVideo != null) {
+                        prev.characterVideoSwitchNonce + 1L
+                    } else {
+                        prev.characterVideoSwitchNonce
+                    },
+                    isCharacterPlaying = if (!active && validSavedVideo != null) {
+                        true
+                    } else {
+                        prev.isCharacterPlaying
+                    }
+                )
+            }
+            persistCurrentState()
+        }
     }
 
     fun flipCamera() {

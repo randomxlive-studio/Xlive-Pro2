@@ -147,7 +147,7 @@ fun StudioControlPanel(
     onToggleVoiceReduce: () -> Unit,
     onSelectScaleMode: (DisplayScaleMode) -> Unit,
     onSelectAspectPreset: (GameplayAspectPreset) -> Unit,
-    onPickCharacterMedia: () -> Unit,
+    onPickCharacterVideo: () -> Unit,
     onToggleCamera: () -> Unit,
     onFlipCamera: () -> Unit,
     onToggleCharacterPlay: () -> Unit,
@@ -966,7 +966,7 @@ fun StudioControlPanel(
 
                 HorizontalDivider(color = StudioBorderBlue.copy(alpha = 0.5f))
 
-                // 6. CIRCULAR CHARACTER & LIVE CAMERA
+                // 6. CIRCULAR CHARACTER (VIDEO OR LIVE CAMERA ONLY)
                 SectionHeader(stringResource(R.string.section_character))
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -974,10 +974,13 @@ fun StudioControlPanel(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     StudioToggleBtn(
-                        text = stringResource(R.string.btn_upload_character),
+                        text = stringResource(
+                            if (state.characterLocalPath != null) R.string.btn_change_character_video
+                            else R.string.btn_upload_character
+                        ),
                         icon = Icons.Default.UploadFile,
                         isActive = state.characterLocalPath != null && !state.isCameraActive,
-                        onClick = onPickCharacterMedia,
+                        onClick = onPickCharacterVideo,
                         testTag = "upload_character_button"
                     )
                     StudioToggleBtn(
@@ -1006,7 +1009,7 @@ fun StudioControlPanel(
                         onClick = onTogglePulseOnSpeak,
                         testTag = "toggle_character_pulse_button"
                     )
-                    if (!state.isCharacterImage && state.characterLocalPath != null) {
+                    if (!state.isCameraActive && state.characterLocalPath != null) {
                         StudioToggleBtn(
                             text = stringResource(
                                 if (state.isCharacterPlaying) R.string.btn_pause else R.string.btn_play
