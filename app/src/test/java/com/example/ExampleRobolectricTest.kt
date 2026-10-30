@@ -9,6 +9,7 @@ import com.example.data.StudioPreferencesRepository
 import com.example.engine.AdBlockerEngine
 import com.example.engine.UniversalVideoResolver
 import com.example.engine.isLikelyVideoStreamUrl
+import com.example.model.BadgeTransformState
 import com.example.model.StudioUiState
 import com.example.service.LiveCommentBus
 import java.io.File
@@ -103,7 +104,6 @@ class ExampleRobolectricTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val repo = StudioPreferencesRepository(context)
 
-        // Simulate switching character video 5 times in a row from external source files
         var previousSavedPath: String? = null
         repeat(5) { idx ->
             val externalSource = File(context.cacheDir, "picker_temp_$idx.mp4").apply {
@@ -113,12 +113,10 @@ class ExampleRobolectricTest {
             assertTrue(result.isSuccess)
             val copiedPath = result.getOrThrow()
 
-            // Must be stored inside filesDir/character_videos and never reuse temporary picker URI
             assertTrue(copiedPath.startsWith(context.filesDir.absolutePath))
             assertTrue(repo.isValidCharacterVideoFile(copiedPath))
             if (previousSavedPath != null) {
                 assertNotEquals(previousSavedPath, copiedPath)
-                // Previous file still exists until deferred cleanup runs after player stops
                 assertTrue(File(previousSavedPath!!).exists())
             }
 
@@ -132,14 +130,94 @@ class ExampleRobolectricTest {
             externalSource.delete()
         }
 
-        // Verify app restart restores the last selected character video from filesDir
         val restored = repo.loadInitialState()
         assertEquals(previousSavedPath, restored.characterLocalPath)
 
-        // Delete the saved file and verify restart falls back cleanly to default null state without crashing
         File(previousSavedPath!!).delete()
         val restoredAfterMissing = repo.loadInitialState()
         assertNull(restoredAfterMissing.characterLocalPath)
+    }
+
+    @Test
+    fun `reset gameplay and reset circle delete internal files independently and clear datastore keys`(): Unit = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = StudioPreferencesRepository(context)
+
+        val tempGameplaySrc = File(context.cacheDir, "src_gameplay.mp4").apply {
+            writeBytes("gameplay-video-bytes".toByteArray())
+        }
+        val tempCircleSrc = File(context.cacheDir, "src_circle.mp4").apply {
+            writeBytes("circle-video-bytes".toByteArray())
+        }
+
+        val gameplaySaved = repo.copyPickedMediaToInternalStorage(Uri.fromFile(tempGameplaySrc), "gameplay")
+        assertNotNull(gameplaySaved)
+        val gameplayPath = gameplaySaved!!.first
+
+        val circlePath = repo.copyCharacterVideoToInternalStorage(Uri.fromFile(tempCircleSrc)).getOrThrow()
+
+        repo.saveState(
+            StudioUiState(
+                gameplayLocalPath = gameplayPath,
+                activeUrl = "https://example.com/stream.mp4",
+                characterLocalPath = circlePath
+            )
+        )
+
+        // 1. Delete gameplay ONLY -> circle video must remain intact on disk & in DataStore
+        repo.deleteGameplayMediaAndClearPrefs(gameplayPath)
+        assertFalse(File(gameplayPath).exists())
+        assertTrue(File(circlePath).exists())
+
+        val afterGameplayReset = repo.loadInitialState()
+        assertNull(afterGameplayReset.gameplayLocalPath)
+        assertEquals("", afterGameplayReset.activeUrl)
+        assertEquals(circlePath, afterGameplayReset.characterLocalPath)
+
+        // 2. Delete circle ONLY -> circle video deleted from disk & DataStore; picking again works
+        repo.deleteCharacterMediaAndClearPrefs(circlePath)
+        assertFalse(File(circlePath).exists())
+        val afterCircleReset = repo.loadInitialState()
+        assertNull(afterCircleReset.characterLocalPath)
+
+        // 3. Picking a new circle video after deleting works normally
+        val circlePathAfterReset = repo.copyCharacterVideoToInternalStorage(Uri.fromFile(tempCircleSrc)).getOrThrow()
+        assertTrue(File(circlePathAfterReset).exists())
+        repo.deleteCharacterMediaAndClearPrefs(circlePathAfterReset)
+
+        tempGameplaySrc.delete()
+        tempCircleSrc.delete()
+    }
+
+    @Test
+    fun `badge transform clamps scale to 0_5x_2_5x and persists portrait and landscape states`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = StudioPreferencesRepository(context)
+
+        val tooSmall = BadgeTransformState(x = -0.5f, y = 2.0f, scale = 0.1f).clamped()
+        assertEquals(0f, tooSmall.x, 0.0001f)
+        assertEquals(0.98f, tooSmall.y, 0.0001f)
+        assertEquals(0.5f, tooSmall.scale, 0.0001f)
+
+        val tooBig = BadgeTransformState(x = 0.25f, y = 0.35f, scale = 9.0f).clamped()
+        assertEquals(2.5f, tooBig.scale, 0.0001f)
+
+        val customPortrait = BadgeTransformState(x = 0.22f, y = 0.44f, scale = 1.65f)
+        val customLandscape = BadgeTransformState(x = 0.55f, y = 0.18f, scale = 0.80f)
+        repo.saveState(
+            StudioUiState(
+                badgePortraitState = customPortrait,
+                badgeLandscapeState = customLandscape
+            )
+        )
+
+        val loaded = repo.loadInitialState()
+        assertEquals(customPortrait.x, loaded.badgePortraitState.x, 0.0001f)
+        assertEquals(customPortrait.y, loaded.badgePortraitState.y, 0.0001f)
+        assertEquals(customPortrait.scale, loaded.badgePortraitState.scale, 0.0001f)
+        assertEquals(customLandscape.x, loaded.badgeLandscapeState.x, 0.0001f)
+        assertEquals(customLandscape.y, loaded.badgeLandscapeState.y, 0.0001f)
+        assertEquals(customLandscape.scale, loaded.badgeLandscapeState.scale, 0.0001f)
     }
 
     @Test

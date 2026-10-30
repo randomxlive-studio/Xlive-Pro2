@@ -30,7 +30,7 @@ object LiveCommentBus {
         private set
 
     private val handledHashes = LinkedHashSet<String>()
-    private const val MAX_HANDLED_HISTORY = 1200
+    private const val MAX_HANDLED_HISTORY = 250
 
     private val SYSTEM_EVENT_PATTERNS = listOf(
         "joined",
@@ -78,6 +78,20 @@ object LiveCommentBus {
         if (!active) {
             synchronized(this) {
                 _waitingQueue.value = emptyList()
+            }
+        }
+    }
+
+    fun trimMemory() {
+        synchronized(this) {
+            while (handledHashes.size > 50) {
+                val it = handledHashes.iterator()
+                if (it.hasNext()) {
+                    it.next()
+                    it.remove()
+                } else {
+                    break
+                }
             }
         }
     }

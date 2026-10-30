@@ -145,7 +145,7 @@ fun DraggableStudioWindow(
                                 w = newW,
                                 h = newH
                             ).clamped()
-                            currentOnRectChange(next, true)
+                            currentOnRectChange(next, false)
                         }
                     }
             )

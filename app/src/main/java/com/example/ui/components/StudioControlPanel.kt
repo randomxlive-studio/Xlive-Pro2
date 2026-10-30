@@ -167,6 +167,7 @@ fun StudioControlPanel(
     onAiCooldownChange: (Int) -> Unit,
     onResetGameplay: () -> Unit,
     onResetCharacter: () -> Unit,
+    onResetBadge: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var showApiKeyPlain by remember { mutableStateOf(false) }
@@ -1033,8 +1034,9 @@ fun StudioControlPanel(
 
                 // 7. RESET & BROADCAST
                 SectionHeader(stringResource(R.string.section_reset))
-                Row(
+                FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     StudioToggleBtn(
@@ -1042,16 +1044,21 @@ fun StudioControlPanel(
                         icon = Icons.Default.RestartAlt,
                         isActive = false,
                         onClick = onResetGameplay,
-                        testTag = "reset_gameplay_button",
-                        modifier = Modifier.weight(1f)
+                        testTag = "reset_gameplay_button"
                     )
                     StudioToggleBtn(
                         text = stringResource(R.string.btn_reset_character),
                         icon = Icons.Default.RestartAlt,
                         isActive = false,
                         onClick = onResetCharacter,
-                        testTag = "reset_character_button",
-                        modifier = Modifier.weight(1f)
+                        testTag = "reset_character_button"
+                    )
+                    StudioToggleBtn(
+                        text = stringResource(R.string.btn_reset_badge),
+                        icon = Icons.Default.RestartAlt,
+                        isActive = false,
+                        onClick = onResetBadge,
+                        testTag = "reset_badge_button"
                     )
                 }
 

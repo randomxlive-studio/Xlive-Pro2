@@ -135,10 +135,14 @@
     <string name="btn_close">Done</string>
 
     <!-- Reset & Tips -->
-    <string name="section_reset">RESET</string>
+    <string name="section_reset">RESET &amp; DELETE MEDIA</string>
     <string name="btn_reset_gameplay">Reset gameplay</string>
     <string name="btn_reset_character">Reset circle</string>
-    <string name="hint_drag_resize">Rotate sideways for full-screen gameplay while the header and circular character stay above the video. Drag or pinch to move and resize.</string>
+    <string name="btn_reset_badge">Reset badge</string>
+    <string name="toast_gameplay_deleted">Gameplay video deleted</string>
+    <string name="toast_circle_deleted">Circle video deleted</string>
+    <string name="toast_badge_reset">Badge position and size reset</string>
+    <string name="hint_drag_resize">Drag with one finger or pinch with two fingers to move and resize the gameplay window, circle, or account badge.</string>
 
     <!-- Broadcast Floating Controls & Accessibility -->
     <string name="cd_exit_broadcast">Back to editing</string>

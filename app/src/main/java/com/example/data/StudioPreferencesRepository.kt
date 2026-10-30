@@ -2,6 +2,8 @@ package com.example.data
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
@@ -12,6 +14,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.ai.AiReplyConfig
+import com.example.model.BadgeTransformState
 import com.example.model.DisplayScaleMode
 import com.example.model.GameplayAspectPreset
 import com.example.model.LlmProviderChoice
@@ -35,9 +38,23 @@ private val Context.studioDataStore: DataStore<Preferences> by preferencesDataSt
 
 class StudioPreferencesRepository(private val context: Context) {
 
+    companion object {
+        // 32KB streaming chunk size (between 8KB and 64KB) — never loads entire video into RAM
+        private const val STREAM_COPY_BUFFER_BYTES = 32 * 1024
+        private const val MAX_AVATAR_DIMENSION_PX = 256
+    }
+
     private object Keys {
         val ACCOUNT_NAME = stringPreferencesKey("account_name")
         val AVATAR_PATH = stringPreferencesKey("avatar_path")
+
+        val BADGE_P_X = floatPreferencesKey("badge_p_x")
+        val BADGE_P_Y = floatPreferencesKey("badge_p_y")
+        val BADGE_P_SCALE = floatPreferencesKey("badge_p_scale")
+        val BADGE_L_X = floatPreferencesKey("badge_l_x")
+        val BADGE_L_Y = floatPreferencesKey("badge_l_y")
+        val BADGE_L_SCALE = floatPreferencesKey("badge_l_scale")
+
         val ACTIVE_URL = stringPreferencesKey("active_url")
         val GAMEPLAY_PATH = stringPreferencesKey("gameplay_path")
         val CHARACTER_PATH = stringPreferencesKey("character_path")
@@ -92,6 +109,8 @@ class StudioPreferencesRepository(private val context: Context) {
             val defG = WindowRectState.DefaultGameplay
             val defCP = WindowRectState.DefaultCharacterPortrait
             val defCL = WindowRectState.DefaultCharacterLandscape
+            val defBP = BadgeTransformState.DefaultPortrait
+            val defBL = BadgeTransformState.DefaultLandscape
 
             val avatarPath = prefs[Keys.AVATAR_PATH]?.takeIf { isValidExistingFile(it) }
             val gameplayPath = prefs[Keys.GAMEPLAY_PATH]?.takeIf { isValidExistingFile(it) }
@@ -100,7 +119,6 @@ class StudioPreferencesRepository(private val context: Context) {
             val validCharacterVideoPath = rawCharacterPath?.takeIf { isValidCharacterVideoFile(it) }
 
             if (!rawCharacterPath.isNullOrBlank() && validCharacterVideoPath == null) {
-                // Saved character file is missing, empty, or a legacy image — clean up safely
                 runCatching {
                     context.studioDataStore.edit { editPrefs ->
                         editPrefs.remove(Keys.CHARACTER_PATH)
@@ -118,6 +136,16 @@ class StudioPreferencesRepository(private val context: Context) {
             StudioUiState(
                 accountName = prefs[Keys.ACCOUNT_NAME] ?: "RandomXLive",
                 avatarLocalPath = avatarPath,
+                badgePortraitState = BadgeTransformState(
+                    x = prefs[Keys.BADGE_P_X] ?: defBP.x,
+                    y = prefs[Keys.BADGE_P_Y] ?: defBP.y,
+                    scale = prefs[Keys.BADGE_P_SCALE] ?: defBP.scale
+                ).clamped(),
+                badgeLandscapeState = BadgeTransformState(
+                    x = prefs[Keys.BADGE_L_X] ?: defBL.x,
+                    y = prefs[Keys.BADGE_L_Y] ?: defBL.y,
+                    scale = prefs[Keys.BADGE_L_SCALE] ?: defBL.scale
+                ).clamped(),
                 urlInput = savedUrl,
                 activeUrl = savedUrl,
                 gameplayLocalPath = gameplayPath,
@@ -198,6 +226,14 @@ class StudioPreferencesRepository(private val context: Context) {
                 } else {
                     prefs.remove(Keys.AVATAR_PATH)
                 }
+
+                prefs[Keys.BADGE_P_X] = state.badgePortraitState.x
+                prefs[Keys.BADGE_P_Y] = state.badgePortraitState.y
+                prefs[Keys.BADGE_P_SCALE] = state.badgePortraitState.scale
+                prefs[Keys.BADGE_L_X] = state.badgeLandscapeState.x
+                prefs[Keys.BADGE_L_Y] = state.badgeLandscapeState.y
+                prefs[Keys.BADGE_L_SCALE] = state.badgeLandscapeState.scale
+
                 prefs[Keys.ACTIVE_URL] = state.activeUrl
                 if (state.gameplayLocalPath != null) {
                     prefs[Keys.GAMEPLAY_PATH] = state.gameplayLocalPath
@@ -255,9 +291,87 @@ class StudioPreferencesRepository(private val context: Context) {
     }
 
     /**
-     * Copies a newly picked character video immediately into internal storage (`filesDir`)
-     * on `Dispatchers.IO`. Never keeps or returns the temporary picker URI, and never deletes
-     * the currently playing video file before the player has stopped & switched.
+     * Permanently deletes all gameplay videos copied into internal storage (`filesDir` / `cacheDir`)
+     * and clears `GAMEPLAY_PATH` + `ACTIVE_URL` + default gameplay window coordinates in DataStore.
+     * Never touches the circular character files or settings.
+     */
+    suspend fun deleteGameplayMediaAndClearPrefs(previousPath: String?) =
+        withContext(Dispatchers.IO) {
+            try {
+                context.studioDataStore.edit { prefs ->
+                    prefs.remove(Keys.GAMEPLAY_PATH)
+                    prefs[Keys.ACTIVE_URL] = ""
+                    prefs[Keys.G_X] = WindowRectState.DefaultGameplay.x
+                    prefs[Keys.G_Y] = WindowRectState.DefaultGameplay.y
+                    prefs[Keys.G_W] = WindowRectState.DefaultGameplay.w
+                    prefs[Keys.G_H] = WindowRectState.DefaultGameplay.h
+                    prefs[Keys.ASPECT_PRESET] = GameplayAspectPreset.LANDSCAPE_16_9.name
+                    prefs[Keys.SCALE_MODE] = DisplayScaleMode.FIT.name
+                }
+            } catch (_: Throwable) {
+            }
+
+            try {
+                if (!previousPath.isNullOrBlank()) {
+                    val f = File(previousPath)
+                    if (f.exists()) runCatching { f.delete() }
+                }
+                File(context.filesDir, "studio_media").listFiles()
+                    ?.filter { it.name.startsWith("gameplay_") }
+                    ?.forEach { file -> runCatching { file.delete() } }
+
+                context.cacheDir.listFiles()
+                    ?.filter { it.name.startsWith("gameplay_") }
+                    ?.forEach { file -> runCatching { file.delete() } }
+            } catch (_: Throwable) {
+            }
+        }
+
+    /**
+     * Permanently deletes all character circle videos copied into internal storage (`filesDir` / `cacheDir`)
+     * and clears `CHARACTER_PATH` + default circle coordinates in DataStore.
+     * Never touches gameplay files or settings.
+     */
+    suspend fun deleteCharacterMediaAndClearPrefs(previousPath: String?) =
+        withContext(Dispatchers.IO) {
+            try {
+                context.studioDataStore.edit { prefs ->
+                    prefs.remove(Keys.CHARACTER_PATH)
+                    prefs.remove(Keys.LEGACY_CHARACTER_IS_IMAGE)
+                    prefs[Keys.C_X] = WindowRectState.DefaultCharacterPortrait.x
+                    prefs[Keys.C_Y] = WindowRectState.DefaultCharacterPortrait.y
+                    prefs[Keys.C_W] = WindowRectState.DefaultCharacterPortrait.w
+                    prefs[Keys.C_H] = WindowRectState.DefaultCharacterPortrait.h
+                    prefs[Keys.CL_X] = WindowRectState.DefaultCharacterLandscape.x
+                    prefs[Keys.CL_Y] = WindowRectState.DefaultCharacterLandscape.y
+                    prefs[Keys.CL_W] = WindowRectState.DefaultCharacterLandscape.w
+                    prefs[Keys.CL_H] = WindowRectState.DefaultCharacterLandscape.h
+                }
+            } catch (_: Throwable) {
+            }
+
+            try {
+                if (!previousPath.isNullOrBlank()) {
+                    val f = File(previousPath)
+                    if (f.exists()) runCatching { f.delete() }
+                }
+                File(context.filesDir, "character_videos").listFiles()
+                    ?.forEach { file -> runCatching { file.delete() } }
+
+                File(context.filesDir, "studio_media").listFiles()
+                    ?.filter { it.name.startsWith("character_") }
+                    ?.forEach { file -> runCatching { file.delete() } }
+
+                context.cacheDir.listFiles()
+                    ?.filter { it.name.startsWith("character_") }
+                    ?.forEach { file -> runCatching { file.delete() } }
+            } catch (_: Throwable) {
+            }
+        }
+
+    /**
+     * Streams a picked character video in 32KB chunks (`InputStream.copyTo` inside `use{}`)
+     * on `Dispatchers.IO` into `filesDir/character_videos`. Never loads the whole file into memory.
      */
     suspend fun copyCharacterVideoToInternalStorage(uri: Uri): Result<String> =
         withContext(Dispatchers.IO) {
@@ -290,7 +404,7 @@ class StudioPreferencesRepository(private val context: Context) {
 
                 val bytesCopied = context.contentResolver.openInputStream(uri)?.use { input ->
                     tempFile.outputStream().use { output ->
-                        val copied = input.copyTo(output, bufferSize = 64 * 1024)
+                        val copied = input.copyTo(output, bufferSize = STREAM_COPY_BUFFER_BYTES)
                         output.flush()
                         runCatching { output.fd.sync() }
                         copied
@@ -309,22 +423,22 @@ class StudioPreferencesRepository(private val context: Context) {
                     )
                 }
 
-                val moved = tempFile.renameTo(destFile)
-                val finalFile = if (moved && destFile.exists() && destFile.length() > 0L) {
-                    destFile
-                } else {
-                    tempFile.copyTo(destFile, overwrite = true)
+                if (!tempFile.renameTo(destFile)) {
+                    tempFile.inputStream().use { inp ->
+                        destFile.outputStream().use { out ->
+                            inp.copyTo(out, bufferSize = STREAM_COPY_BUFFER_BYTES)
+                        }
+                    }
                     runCatching { tempFile.delete() }
-                    destFile
                 }
 
-                if (!finalFile.exists() || finalFile.length() <= 0L) {
+                if (!destFile.exists() || destFile.length() <= 0L) {
                     return@withContext Result.failure(
                         IllegalStateException("Failed to save video copy into internal storage")
                     )
                 }
 
-                Result.success(finalFile.absolutePath)
+                Result.success(destFile.absolutePath)
             } catch (t: Throwable) {
                 Result.failure(t)
             }
@@ -337,17 +451,14 @@ class StudioPreferencesRepository(private val context: Context) {
                     runCatching { File(it).canonicalPath }.getOrDefault(File(it).absolutePath)
                 }
 
-                val charVideoDir = File(context.filesDir, "character_videos")
-                charVideoDir.listFiles()?.forEach { file ->
+                File(context.filesDir, "character_videos").listFiles()?.forEach { file ->
                     val candidatePath = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
                     if (candidatePath != keepCanonical) {
                         runCatching { file.delete() }
                     }
                 }
 
-                // Also clean up any legacy character_* files in studio_media except activePathToKeep
-                val legacyMediaDir = File(context.filesDir, "studio_media")
-                legacyMediaDir.listFiles()
+                File(context.filesDir, "studio_media").listFiles()
                     ?.filter { it.name.startsWith("character_") }
                     ?.forEach { file ->
                         val candidatePath = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
@@ -358,6 +469,10 @@ class StudioPreferencesRepository(private val context: Context) {
             }
         }
 
+    /**
+     * Streams a gameplay video in 32KB chunks (`InputStream.copyTo` inside `use{}`) on `Dispatchers.IO`,
+     * or downsamples an avatar image to <= 256x256px and recycles the temporary Bitmap immediately.
+     */
     suspend fun copyPickedMediaToInternalStorage(
         uri: Uri,
         slotPrefix: String
@@ -365,17 +480,17 @@ class StudioPreferencesRepository(private val context: Context) {
         runCatching {
             tryTakePersistableReadPermission(uri)
 
+            if (slotPrefix == "avatar") {
+                val avatarPath = copyDownsampledAvatarToInternalStorage(uri)
+                return@withContext avatarPath?.let { it to true }
+            }
+
             val mediaDir = File(context.filesDir, "studio_media").apply { mkdirs() }
             val mime = runCatching { context.contentResolver.getType(uri) }
                 .getOrNull()
                 .orEmpty()
                 .lowercase(Locale.US)
-            val isImage = mime.startsWith("image/")
             val ext = when {
-                mime.contains("png") -> "png"
-                mime.contains("webp") -> "webp"
-                mime.contains("gif") -> "gif"
-                isImage -> "jpg"
                 mime.contains("webm") -> "webm"
                 mime.contains("matroska") || mime.contains("mkv") -> "mkv"
                 else -> "mp4"
@@ -387,24 +502,71 @@ class StudioPreferencesRepository(private val context: Context) {
 
             context.contentResolver.openInputStream(uri)?.use { input ->
                 tempFile.outputStream().use { output ->
-                    input.copyTo(output, bufferSize = 64 * 1024)
+                    input.copyTo(output, bufferSize = STREAM_COPY_BUFFER_BYTES)
                     output.flush()
                     runCatching { output.fd.sync() }
                 }
             } ?: return@withContext null
 
             if (!tempFile.renameTo(destFile)) {
-                tempFile.copyTo(destFile, overwrite = true)
+                tempFile.inputStream().use { inp ->
+                    destFile.outputStream().use { out ->
+                        inp.copyTo(out, bufferSize = STREAM_COPY_BUFFER_BYTES)
+                    }
+                }
                 runCatching { tempFile.delete() }
             }
 
             if (destFile.exists() && destFile.length() > 0L) {
-                destFile.absolutePath to isImage
+                destFile.absolutePath to false
             } else {
                 runCatching { destFile.delete() }
                 null
             }
         }.getOrNull()
+    }
+
+    private fun copyDownsampledAvatarToInternalStorage(uri: Uri): String? {
+        val mediaDir = File(context.filesDir, "studio_media").apply { mkdirs() }
+        val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, boundsOpts)
+        }
+
+        val srcW = boundsOpts.outWidth
+        val srcH = boundsOpts.outHeight
+        if (srcW <= 0 || srcH <= 0) return null
+
+        var sampleSize = 1
+        while (srcW / sampleSize > MAX_AVATAR_DIMENSION_PX * 2 ||
+            srcH / sampleSize > MAX_AVATAR_DIMENSION_PX * 2
+        ) {
+            sampleSize *= 2
+        }
+
+        val decodeOpts = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+
+        val decoded = context.contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, decodeOpts)
+        } ?: return null
+
+        val destFile = File(
+            mediaDir,
+            "avatar_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.jpg"
+        )
+        try {
+            destFile.outputStream().use { out ->
+                decoded.compress(Bitmap.CompressFormat.JPEG, 86, out)
+                out.flush()
+            }
+        } finally {
+            decoded.recycle()
+        }
+
+        return destFile.takeIf { it.exists() && it.length() > 0L }?.absolutePath
     }
 
     suspend fun cleanupOldSlotMedia(slotPrefix: String, activePathToKeep: String?) =
@@ -413,8 +575,7 @@ class StudioPreferencesRepository(private val context: Context) {
                 val keepCanonical = activePathToKeep?.let {
                     runCatching { File(it).canonicalPath }.getOrDefault(File(it).absolutePath)
                 }
-                val mediaDir = File(context.filesDir, "studio_media")
-                mediaDir.listFiles()
+                File(context.filesDir, "studio_media").listFiles()
                     ?.filter { it.name.startsWith("${slotPrefix}_") }
                     ?.forEach { file ->
                         val candidate = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
@@ -435,7 +596,7 @@ class StudioPreferencesRepository(private val context: Context) {
             }
         } catch (_: Throwable) {
             // Photo Picker or single-grant providers may not offer persistable URI grants;
-            // safe because we immediately copy the file into filesDir.
+            // safe because we immediately stream-copy the file into filesDir.
         }
     }
 

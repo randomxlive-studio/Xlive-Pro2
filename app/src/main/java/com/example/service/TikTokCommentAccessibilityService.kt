@@ -38,11 +38,12 @@ class TikTokCommentAccessibilityService : AccessibilityService() {
             val screenHeight = screenBounds.height().coerceAtLeast(800)
             val screenWidth = screenBounds.width().coerceAtLeast(400)
 
-            val extractedPairs = mutableListOf<Pair<String, String>>()
+            val extractedPairs = ArrayList<Pair<String, String>>(16)
             traverseForComments(
                 node = root,
                 screenWidth = screenWidth,
                 screenHeight = screenHeight,
+                depth = 0,
                 outPairs = extractedPairs
             )
 
@@ -62,9 +63,10 @@ class TikTokCommentAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo?,
         screenWidth: Int,
         screenHeight: Int,
+        depth: Int,
         outPairs: MutableList<Pair<String, String>>
     ) {
-        if (node == null || !node.isVisibleToUser) return
+        if (node == null || depth > 14 || outPairs.size >= 16 || !node.isVisibleToUser) return
 
         val viewId = node.viewIdResourceName.orEmpty().lowercase()
         val className = node.className?.toString().orEmpty()
@@ -118,9 +120,10 @@ class TikTokCommentAccessibilityService : AccessibilityService() {
             }
         }
 
-        val count = node.childCount
+        val count = node.childCount.coerceAtMost(24)
         for (i in 0 until count) {
-            traverseForComments(node.getChild(i), screenWidth, screenHeight, outPairs)
+            if (outPairs.size >= 16) break
+            traverseForComments(node.getChild(i), screenWidth, screenHeight, depth + 1, outPairs)
         }
     }
 

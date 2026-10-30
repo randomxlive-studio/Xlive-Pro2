@@ -154,9 +154,17 @@ fun PlatformBrowserSheet(
 
         DisposableEffect(Unit) {
             onDispose {
+                capturedStreams.clear()
                 webViewRef?.apply {
-                    stopLoading()
-                    destroy()
+                    runCatching {
+                        stopLoading()
+                        loadUrl("about:blank")
+                        clearHistory()
+                        clearCache(false)
+                        (parent as? ViewGroup)?.removeView(this)
+                        removeAllViews()
+                        destroy()
+                    }
                 }
                 webViewRef = null
             }
@@ -321,6 +329,9 @@ fun PlatformBrowserSheet(
                                         fun onStreamSniffed(url: String, source: String) {
                                             mainHandler.post {
                                                 if (capturedStreams.none { it.url == url }) {
+                                                    while (capturedStreams.size >= 10) {
+                                                        capturedStreams.removeAt(capturedStreams.lastIndex)
+                                                    }
                                                     capturedStreams.add(
                                                         0,
                                                         SniffedStream(
@@ -383,6 +394,9 @@ fun PlatformBrowserSheet(
                                             val ref = request?.requestHeaders?.get("Referer") ?: currentPageUrl
                                             mainHandler.post {
                                                 if (capturedStreams.none { it.url == reqUrl }) {
+                                                    while (capturedStreams.size >= 10) {
+                                                        capturedStreams.removeAt(capturedStreams.lastIndex)
+                                                    }
                                                     capturedStreams.add(
                                                         0,
                                                         SniffedStream(

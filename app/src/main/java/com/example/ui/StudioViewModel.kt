@@ -7,6 +7,7 @@ import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import coil.Coil
 import com.example.R
 import com.example.ai.AiReplyConfig
 import com.example.ai.AiReplyResult
@@ -14,7 +15,9 @@ import com.example.ai.SarcasticAiResponder
 import com.example.ai.TtsVoiceManager
 import com.example.crash.CrashReportManager
 import com.example.data.StudioPreferencesRepository
+import com.example.engine.StudioExoPlayerManager
 import com.example.engine.UniversalVideoResolver
+import com.example.model.BadgeTransformState
 import com.example.model.DetectedPlatform
 import com.example.model.DisplayScaleMode
 import com.example.model.GameplayAspectPreset
@@ -48,14 +51,18 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val aiResponder = SarcasticAiResponder()
     private val ttsVoiceManager = TtsVoiceManager(application.applicationContext)
 
+    val playerManager = StudioExoPlayerManager(application.applicationContext)
+
     private val _uiState = MutableStateFlow(StudioUiState())
     val uiState: StateFlow<StudioUiState> = _uiState.asStateFlow()
 
     private var resolveJob: Job? = null
     private var bannerJob: Job? = null
     private var previewVoiceJob: Job? = null
+    private var debouncedSaveJob: Job? = null
 
     private val characterSwitchMutex = Mutex()
+    private val gameplayResetMutex = Mutex()
 
     @Volatile
     private var isInitialStateLoaded: Boolean = false
@@ -73,7 +80,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             LiveCommentBus.ownUsernameLower = saved.accountName.lowercase()
             _uiState.update { current ->
                 saved.copy(
-                    // If user picked a video while startup was finishing, preserve the newer pick
+                    gameplayLocalPath = current.gameplayLocalPath ?: saved.gameplayLocalPath,
                     characterLocalPath = current.characterLocalPath ?: saved.characterLocalPath,
                     characterVideoSwitchNonce = maxOf(
                         current.characterVideoSwitchNonce,
@@ -163,7 +170,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update {
                             it.copy(dailyAiRequestCount = it.dailyAiRequestCount + 1)
                         }
-                        persistCurrentState()
+                        persistCurrentStateNow()
 
                         // Speak audio ONLY (never draw any text bubble or overlay text)
                         val latest = _uiState.value
@@ -181,13 +188,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
 
                     AiReplyResult.RateLimited -> {
-                        // Free-tier limit reached: pause silently without crashing or spamming
                         isSilentlyPausedForRateLimit = true
                         delay(5_000L)
                     }
 
                     AiReplyResult.SilentFailure -> {
-                        // Silent skip without crashing or spamming
                         val cooldownMs = (_uiState.value.aiCooldownSeconds.coerceIn(3, 120)) * 1000L
                         delay(cooldownMs)
                     }
@@ -196,11 +201,44 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun persistCurrentState() {
+    /**
+     * Immediate persistence for discrete button clicks, media selections, and settings toggles.
+     */
+    private fun persistCurrentStateNow() {
         if (!isInitialStateLoaded) return
+        debouncedSaveJob?.cancel()
         val snapshot = _uiState.value
-        viewModelScope.launch {
-            repo.saveState(snapshot)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { repo.saveState(snapshot) }
+        }
+    }
+
+    /**
+     * Debounced persistence for high-frequency touch drag & pinch-zoom gestures so touch handling
+     * never allocates DataStore transactions on every frame.
+     */
+    private fun scheduleDebouncedSave() {
+        if (!isInitialStateLoaded) return
+        debouncedSaveJob?.cancel()
+        debouncedSaveJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(450L)
+            runCatching { repo.saveState(_uiState.value) }
+        }
+    }
+
+    fun onTrimMemory(level: Int) {
+        runCatching { playerManager.trimMemory() }
+        runCatching { LiveCommentBus.trimMemory() }
+        runCatching {
+            Coil.imageLoader(getApplication()).memoryCache?.clear()
+        }
+    }
+
+    fun onLowMemory() {
+        runCatching { playerManager.trimMemory() }
+        runCatching { LiveCommentBus.trimMemory() }
+        runCatching {
+            Coil.imageLoader(getApplication()).memoryCache?.clear()
         }
     }
 
@@ -228,6 +266,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun clearUrlAndReturnToLocal() {
         resolveJob?.cancel()
+        val hasLocalGameplay = !_uiState.value.gameplayLocalPath.isNullOrBlank()
+        if (!hasLocalGameplay) {
+            playerManager.releaseGameplayPlayer()
+        }
         _uiState.update {
             it.copy(
                 urlInput = "",
@@ -239,7 +281,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 isResolvingUrl = false
             )
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun loadVideoLink(rawInput: String = _uiState.value.urlInput, keepCurrentEngine: Boolean = false) {
@@ -269,18 +311,33 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             showStatus(getApplication<Application>().getString(R.string.status_resolving), true)
 
             val resolved = resolver.resolve(trimmed)
+            val nextEngine = if (keepCurrentEngine) {
+                _uiState.value.engineMode
+            } else {
+                PlaybackEngineMode.AUTO
+            }
+            val effectiveNext = if (nextEngine == PlaybackEngineMode.AUTO) {
+                resolved.recommendedEngine
+            } else {
+                nextEngine
+            }
+            if (effectiveNext != PlaybackEngineMode.DIRECT_STREAM) {
+                // Free ExoPlayer memory when Gameplay switches to WebView engine
+                playerManager.releaseGameplayPlayer()
+            }
+
             _uiState.update { prev ->
                 prev.copy(
                     activeUrl = resolved.resolvedUrl,
                     urlInput = resolved.resolvedUrl,
                     resolvedTarget = resolved,
-                    engineMode = if (keepCurrentEngine) prev.engineMode else PlaybackEngineMode.AUTO,
+                    engineMode = nextEngine,
                     isResolvingUrl = false,
                     isGameplayPlaying = true,
                     playerReloadNonce = prev.playerReloadNonce + 1
                 )
             }
-            persistCurrentState()
+            persistCurrentStateNow()
             showStatus(
                 getApplication<Application>().getString(
                     R.string.status_loaded_platform,
@@ -298,27 +355,40 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun handlePickedGameplayVideo(uri: Uri) {
+        val app = getApplication<Application>()
+        try {
+            repo.tryTakePersistableReadPermission(uri)
+        } catch (_: Throwable) {
+        }
+
         viewModelScope.launch {
-            runCatching {
-                val saved = repo.copyPickedMediaToInternalStorage(uri, "gameplay")
-                if (saved != null) {
-                    val (savedPath, _) = saved
-                    _uiState.update {
-                        it.copy(
-                            gameplayLocalPath = savedPath,
-                            activeUrl = "",
-                            urlInput = "",
-                            resolvedTarget = null,
-                            sniffedStreams = emptyList(),
-                            selectedSniffedStream = null,
-                            isGameplayPlaying = true,
-                            playerReloadNonce = it.playerReloadNonce + 1
-                        )
+            gameplayResetMutex.withLock {
+                runCatching {
+                    val saved = repo.copyPickedMediaToInternalStorage(uri, "gameplay")
+                    if (saved != null) {
+                        val (savedPath, _) = saved
+                        _uiState.update {
+                            it.copy(
+                                gameplayLocalPath = savedPath,
+                                activeUrl = "",
+                                urlInput = "",
+                                resolvedTarget = null,
+                                sniffedStreams = emptyList(),
+                                selectedSniffedStream = null,
+                                isAdDetectedNow = false,
+                                isGameplayPlaying = true,
+                                playerReloadNonce = it.playerReloadNonce + 1
+                            )
+                        }
+                        if (isInitialStateLoaded) {
+                            runCatching { repo.saveState(_uiState.value) }
+                        }
+                        showStatus(app.getString(R.string.status_saved_local), true)
+                        viewModelScope.launch(Dispatchers.IO) {
+                            delay(1000L)
+                            repo.cleanupOldSlotMedia("gameplay", _uiState.value.gameplayLocalPath)
+                        }
                     }
-                    persistCurrentState()
-                    showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
-                    delay(1200L)
-                    repo.cleanupOldSlotMedia("gameplay", savedPath)
                 }
             }
         }
@@ -327,8 +397,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * Safe character video change flow:
      * 1. Takes persistable URI permission where applicable.
-     * 2. Stops Camera / releases current video player cleanly before switching.
-     * 3. Copies the picked video stream into internal `filesDir/character_videos` on `Dispatchers.IO`.
+     * 2. Stops Camera cleanly and reuses the single character ExoPlayer via setMediaItem/prepare.
+     * 3. Streams the picked video in 32KB chunks into internal `filesDir/character_videos` on `Dispatchers.IO`.
      * 4. Plays exclusively from the `filesDir` copy and cleans up older copies after switching.
      */
     fun handlePickedCharacterVideo(uri: Uri) {
@@ -344,7 +414,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     ?.takeIf { repo.isValidCharacterVideoFile(it) }
 
                 try {
-                    // Tear down active Camera or previous ExoPlayer first before loading the new video
                     _uiState.update {
                         it.copy(
                             isCameraActive = false,
@@ -366,13 +435,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                             )
                         }
                         if (isInitialStateLoaded) {
-                            repo.saveState(_uiState.value)
+                            runCatching { repo.saveState(_uiState.value) }
                         }
                         showStatus(app.getString(R.string.status_saved_local), true)
 
-                        // Clean up previous copied character videos safely after old player released
                         viewModelScope.launch(Dispatchers.IO) {
-                            delay(1500L)
+                            delay(1200L)
                             repo.cleanupOldCharacterVideos(
                                 activePathToKeep = _uiState.value.characterLocalPath
                             )
@@ -420,6 +488,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun onCharacterVideoPlaybackError(errorDetail: String) {
         val app = getApplication<Application>()
         runCatching {
+            playerManager.releaseCharacterPlayer()
             _uiState.update {
                 it.copy(
                     characterLocalPath = null,
@@ -427,7 +496,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     isCameraActive = false
                 )
             }
-            persistCurrentState()
+            persistCurrentStateNow()
             viewModelScope.launch(Dispatchers.IO) {
                 delay(500L)
                 repo.cleanupOldCharacterVideos(activePathToKeep = null)
@@ -442,6 +511,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun onCharacterVideoFileMissing() {
         val app = getApplication<Application>()
         runCatching {
+            playerManager.releaseCharacterPlayer()
             _uiState.update {
                 it.copy(
                     characterLocalPath = null,
@@ -449,7 +519,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     isCameraActive = false
                 )
             }
-            persistCurrentState()
+            persistCurrentStateNow()
             showStatus(
                 app.getString(R.string.character_video_missing_restored_default),
                 false
@@ -475,7 +545,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 if (saved != null) {
                     val (savedPath, _) = saved
                     _uiState.update { it.copy(avatarLocalPath = savedPath) }
-                    persistCurrentState()
+                    persistCurrentStateNow()
                     showStatus(getApplication<Application>().getString(R.string.status_saved_local), true)
                     delay(1000L)
                     repo.cleanupOldSlotMedia("avatar", savedPath)
@@ -487,6 +557,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun onEmbedBlockedOrFailed(reason: String) {
         val current = _uiState.value
         if (current.effectiveEngine != PlaybackEngineMode.WEB_ISOLATOR) {
+            playerManager.releaseGameplayPlayer()
             _uiState.update {
                 it.copy(
                     engineMode = PlaybackEngineMode.WEB_ISOLATOR,
@@ -503,6 +574,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun onDirectStreamFailed(errorCode: String) {
         val current = _uiState.value
         if (current.activeUrl.isNotBlank()) {
+            playerManager.releaseGameplayPlayer()
             _uiState.update {
                 it.copy(
                     selectedSniffedStream = null,
@@ -556,6 +628,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val l = s.url.lowercase()
             (l.contains(".m3u8") || l.contains(".mp4")) && !l.contains("googlevideo.com")
         }
+        if (firstPlayable == null) {
+            playerManager.releaseGameplayPlayer()
+        }
         val target = ResolvedVideoTarget(
             originalInput = pageUrl,
             resolvedUrl = pageUrl,
@@ -574,14 +649,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 urlInput = pageUrl,
                 activeUrl = pageUrl,
                 resolvedTarget = target,
-                sniffedStreams = capturedStreams,
+                sniffedStreams = capturedStreams.take(8),
                 selectedSniffedStream = firstPlayable,
                 engineMode = PlaybackEngineMode.AUTO,
                 isGameplayPlaying = true,
                 playerReloadNonce = it.playerReloadNonce + 1
             )
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun applyFromBrowserDirectStream(stream: SniffedStream, pageUrl: String) {
@@ -610,7 +685,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 playerReloadNonce = it.playerReloadNonce + 1
             )
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun onAdStateChanged(isAdShowing: Boolean) {
@@ -619,22 +694,25 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setQualityPreference(pref: VideoQualityPreference) {
         _uiState.update { it.copy(qualityPreference = pref) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun toggleAdBlocker() {
         _uiState.update { it.copy(isAdBlockerEnabled = !it.isAdBlockerEnabled) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun setEngineMode(mode: PlaybackEngineMode) {
+        if (mode != PlaybackEngineMode.DIRECT_STREAM && mode != PlaybackEngineMode.AUTO) {
+            playerManager.releaseGameplayPlayer()
+        }
         _uiState.update {
             it.copy(
                 engineMode = mode,
                 playerReloadNonce = it.playerReloadNonce + 1
             )
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun toggleUserAgentMode() {
@@ -646,7 +724,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             }
             it.copy(userAgentMode = next, playerReloadNonce = it.playerReloadNonce + 1)
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun reloadPlayer() {
@@ -656,7 +734,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun updateAccountName(name: String) {
         LiveCommentBus.ownUsernameLower = name.trim().lowercase()
         _uiState.update { it.copy(accountName = name) }
-        persistCurrentState()
+        scheduleDebouncedSave()
     }
 
     fun toggleGameplayPlay() {
@@ -665,7 +743,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleGameplaySound() {
         _uiState.update { it.copy(isGameplaySoundOn = !it.isGameplaySoundOn) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun toggleAutoHideAds() {
@@ -676,7 +754,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 isAdDetectedNow = if (!next) false else it.isAdDetectedNow
             )
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun toggleManualCover() {
@@ -685,12 +763,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleVoiceReduce() {
         _uiState.update { it.copy(isVoiceReduceOn = !it.isVoiceReduceOn) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun setDisplayScaleMode(mode: DisplayScaleMode) {
         _uiState.update { it.copy(displayScaleMode = mode) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun setAspectPreset(preset: GameplayAspectPreset) {
@@ -709,12 +787,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 gameplayRect = prev.gameplayRect.copy(w = w, h = h).clamped()
             )
         }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun updateGameplayRect(rect: WindowRectState, saveNow: Boolean) {
         _uiState.update { it.copy(gameplayRect = rect) }
-        if (saveNow) persistCurrentState()
+        if (saveNow) persistCurrentStateNow() else scheduleDebouncedSave()
     }
 
     fun updateCharacterRect(rect: WindowRectState, isLandscape: Boolean, saveNow: Boolean) {
@@ -725,33 +803,157 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 it.copy(characterPortraitRect = rect)
             }
         }
-        if (saveNow) persistCurrentState()
+        if (saveNow) persistCurrentStateNow() else scheduleDebouncedSave()
     }
 
-    fun resetGameplayWindow() {
-        _uiState.update {
-            it.copy(
-                gameplayRect = WindowRectState.DefaultGameplay,
-                aspectPreset = GameplayAspectPreset.LANDSCAPE_16_9,
-                displayScaleMode = DisplayScaleMode.FIT
-            )
-        }
-        persistCurrentState()
-    }
-
-    fun resetCharacterWindow(isLandscape: Boolean) {
+    fun updateBadgeTransform(
+        transform: BadgeTransformState,
+        isLandscape: Boolean,
+        saveNow: Boolean
+    ) {
+        val clamped = transform.clamped()
         _uiState.update {
             if (isLandscape) {
-                it.copy(characterLandscapeRect = WindowRectState.DefaultCharacterLandscape)
+                it.copy(badgeLandscapeState = clamped)
             } else {
-                it.copy(characterPortraitRect = WindowRectState.DefaultCharacterPortrait)
+                it.copy(badgePortraitState = clamped)
             }
         }
-        persistCurrentState()
+        if (saveNow) persistCurrentStateNow() else scheduleDebouncedSave()
+    }
+
+    /**
+     * Permanently deletes the Gameplay video/link/browser page ONLY (leaves Circle & Badge untouched):
+     * 1. Cancels URL resolution, stops, clears, detaches, and releases Gameplay ExoPlayer memory.
+     * 2. Clears local video path, pasted link, browser page, and sniffed streams, showing empty state.
+     * 3. Resets Gameplay window position & size to defaults.
+     * 4. Deletes copied internal gameplay file(s) from filesDir/cacheDir on Dispatchers.IO inside try/catch
+     *    and removes saved path/URL from DataStore so it never returns after restart.
+     * 5. Shows Toast("Gameplay video deleted").
+     */
+    fun resetGameplay() {
+        val app = getApplication<Application>()
+        resolveJob?.cancel()
+        debouncedSaveJob?.cancel()
+
+        val oldPath = _uiState.value.gameplayLocalPath
+        playerManager.releaseGameplayPlayer()
+
+        _uiState.update { prev ->
+            prev.copy(
+                gameplayLocalPath = null,
+                urlInput = "",
+                activeUrl = "",
+                resolvedTarget = null,
+                sniffedStreams = emptyList(),
+                selectedSniffedStream = null,
+                isResolvingUrl = false,
+                isAdDetectedNow = false,
+                isManualCoverOn = false,
+                isGameplayPlaying = false,
+                engineMode = PlaybackEngineMode.AUTO,
+                gameplayRect = WindowRectState.DefaultGameplay,
+                aspectPreset = GameplayAspectPreset.LANDSCAPE_16_9,
+                displayScaleMode = DisplayScaleMode.FIT,
+                playerReloadNonce = prev.playerReloadNonce + 1
+            )
+        }
+
+        val toastText = app.getString(R.string.toast_gameplay_deleted)
+        runCatching {
+            Toast.makeText(app, toastText, Toast.LENGTH_SHORT).show()
+        }
+        showStatus(toastText, true)
+
+        val snapshotAfterReset = _uiState.value
+        viewModelScope.launch(Dispatchers.IO) {
+            gameplayResetMutex.withLock {
+                try {
+                    repo.deleteGameplayMediaAndClearPrefs(oldPath)
+                    if (isInitialStateLoaded) {
+                        repo.saveState(snapshotAfterReset)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Permanently deletes the Circle video or stops Camera ONLY (leaves Gameplay & Badge untouched):
+     * 1. Stops, clears, detaches, and releases Circle ExoPlayer memory, and sets isCameraActive = false
+     *    so CameraX immediately calls unbindAll().
+     * 2. Clears saved character video path and shows the circular empty placeholder.
+     * 3. Resets Circle window position & size to defaults (both portrait & landscape).
+     * 4. Deletes copied internal circle video file(s) from filesDir/cacheDir on Dispatchers.IO inside try/catch
+     *    and clears DataStore so it never returns after restart.
+     * 5. Shows Toast("Circle video deleted").
+     */
+    fun resetCircle() {
+        val app = getApplication<Application>()
+        debouncedSaveJob?.cancel()
+
+        val oldPath = _uiState.value.characterLocalPath
+        playerManager.releaseCharacterPlayer()
+
+        _uiState.update { prev ->
+            prev.copy(
+                characterLocalPath = null,
+                isCharacterVideoSwitching = false,
+                isCameraActive = false,
+                isCharacterPlaying = false,
+                characterVideoSwitchNonce = prev.characterVideoSwitchNonce + 1L,
+                characterPortraitRect = WindowRectState.DefaultCharacterPortrait,
+                characterLandscapeRect = WindowRectState.DefaultCharacterLandscape
+            )
+        }
+
+        val toastText = app.getString(R.string.toast_circle_deleted)
+        runCatching {
+            Toast.makeText(app, toastText, Toast.LENGTH_SHORT).show()
+        }
+        showStatus(toastText, true)
+
+        val snapshotAfterReset = _uiState.value
+        viewModelScope.launch(Dispatchers.IO) {
+            characterSwitchMutex.withLock {
+                try {
+                    repo.deleteCharacterMediaAndClearPrefs(oldPath)
+                    if (isInitialStateLoaded) {
+                        repo.saveState(snapshotAfterReset)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Resets ONLY the Streamer Account Badge position and scale back to portrait & landscape defaults.
+     * Deletes nothing and leaves Gameplay & Circle untouched.
+     */
+    fun resetBadge() {
+        val app = getApplication<Application>()
+        _uiState.update {
+            it.copy(
+                badgePortraitState = BadgeTransformState.DefaultPortrait,
+                badgeLandscapeState = BadgeTransformState.DefaultLandscape
+            )
+        }
+        persistCurrentStateNow()
+        val msg = app.getString(R.string.toast_badge_reset)
+        runCatching {
+            Toast.makeText(app, msg, Toast.LENGTH_SHORT).show()
+        }
+        showStatus(msg, true)
     }
 
     fun setCameraActive(active: Boolean) {
         runCatching {
+            if (active) {
+                // Camera and Video NEVER run at the same time: release video player memory first
+                playerManager.releaseCharacterPlayer()
+            }
             _uiState.update { prev ->
                 val validSavedVideo = prev.characterLocalPath
                     ?.takeIf { repo.isValidCharacterVideoFile(it) }
@@ -771,13 +973,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 )
             }
-            persistCurrentState()
+            persistCurrentStateNow()
         }
     }
 
     fun flipCamera() {
         _uiState.update { it.copy(isFrontCamera = !it.isFrontCamera) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun toggleCharacterPlay() {
@@ -786,12 +988,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleCharacterSound() {
         _uiState.update { it.copy(isCharacterSoundOn = !it.isCharacterSoundOn) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun togglePulseOnAiSpeak() {
         _uiState.update { it.copy(isPulseOnAiSpeakEnabled = !it.isPulseOnAiSpeakEnabled) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     // --- TikTok LIVE Comment Reader & Sarcastic AI Voice Controls ---
@@ -837,7 +1039,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleAiRepliesEnabled() {
         isSilentlyPausedForRateLimit = false
         _uiState.update { it.copy(isAiRepliesEnabled = !it.isAiRepliesEnabled) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun toggleVoiceTtsEnabled() {
@@ -846,39 +1048,39 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             ttsVoiceManager.stopSpeaking()
         }
         _uiState.update { it.copy(isVoiceTtsEnabled = next) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun setLlmProvider(provider: LlmProviderChoice) {
         isSilentlyPausedForRateLimit = false
         _uiState.update { it.copy(llmProvider = provider) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun updateLlmApiKey(key: String) {
         isSilentlyPausedForRateLimit = false
         _uiState.update { it.copy(llmApiKey = key) }
-        persistCurrentState()
+        scheduleDebouncedSave()
     }
 
     fun setSelectedTtsVoice(voiceId: String) {
         _uiState.update { it.copy(selectedTtsVoiceId = voiceId) }
-        persistCurrentState()
+        persistCurrentStateNow()
     }
 
     fun updateTtsSpeed(speed: Float) {
         _uiState.update { it.copy(ttsSpeed = speed.coerceIn(0.5f, 2.0f)) }
-        persistCurrentState()
+        scheduleDebouncedSave()
     }
 
     fun updateTtsPitch(pitch: Float) {
         _uiState.update { it.copy(ttsPitch = pitch.coerceIn(0.5f, 2.0f)) }
-        persistCurrentState()
+        scheduleDebouncedSave()
     }
 
     fun updateAiCooldownSeconds(seconds: Int) {
         _uiState.update { it.copy(aiCooldownSeconds = seconds.coerceIn(5, 90)) }
-        persistCurrentState()
+        scheduleDebouncedSave()
     }
 
     fun previewSelectedTtsVoice() {
@@ -918,6 +1120,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
+        debouncedSaveJob?.cancel()
+        playerManager.releaseAll()
         ttsVoiceManager.shutdown()
         super.onCleared()
     }

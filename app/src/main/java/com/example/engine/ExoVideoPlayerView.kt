@@ -23,26 +23,15 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.VideoSize
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.DefaultRenderersFactory
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import com.example.model.DisplayScaleMode
 import com.example.model.VideoQualityPreference
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
 
@@ -99,6 +88,7 @@ class CenterChannelVoiceReducerProcessor : BaseAudioProcessor() {
 @OptIn(UnstableApi::class)
 @Composable
 fun ExoVideoPlayerView(
+    playerManager: StudioExoPlayerManager,
     sourceUriOrUrl: String,
     headers: Map<String, String>,
     isPlaying: Boolean,
@@ -113,76 +103,31 @@ fun ExoVideoPlayerView(
 ) {
     val context = LocalContext.current
     val currentOnError by rememberUpdatedState(onStreamError)
+    val currentScaleMode by rememberUpdatedState(scaleMode)
 
-    val voiceProcessor = remember { CenterChannelVoiceReducerProcessor() }
-    var videoWidth by remember { mutableIntStateOf(0) }
-    var videoHeight by remember { mutableIntStateOf(0) }
+    // Reuses the ViewModel-managed ExoPlayer instance across video switches & recompositions
+    val exoPlayer = remember(playerManager, reloadNonce, sourceUriOrUrl) {
+        playerManager.getOrCreateGameplayPlayer(headers, qualityPreference)
+    }
+
+    var videoWidth by remember(exoPlayer) { mutableIntStateOf(exoPlayer.videoSize.width) }
+    var videoHeight by remember(exoPlayer) { mutableIntStateOf(exoPlayer.videoSize.height) }
     var textureViewRef by remember { mutableStateOf<TextureView?>(null) }
+    val reusableMatrix = remember { Matrix() }
 
-    val trackSelector = remember(headers) {
-        DefaultTrackSelector(context).apply {
-            setParameters(buildMin720pTrackParameters(this, qualityPreference))
-        }
-    }
-
-    val exoPlayer = remember(headers, trackSelector) {
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15_000)
-            .setReadTimeoutMs(20_000)
-            .setUserAgent(headers["User-Agent"] ?: UniversalVideoResolver.MOBILE_CHROME_UA)
-            .setDefaultRequestProperties(headers)
-
-        val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
-        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
-
-        // Large buffer so playback never drops below 720p even on weak/fluctuating signal:
-        // min 30s, max 120s, playback start 2.5s, rebuffer 5s
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                30_000,
-                120_000,
-                2_500,
-                5_000
-            )
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-
-        val renderersFactory = object : DefaultRenderersFactory(context) {
-            override fun buildAudioSink(
-                context: android.content.Context,
-                enableFloatOutput: Boolean,
-                enableAudioTrackPlaybackParams: Boolean
-            ): AudioSink {
-                return DefaultAudioSink.Builder(context)
-                    .setAudioProcessors(arrayOf(voiceProcessor))
-                    .setEnableFloatOutput(false)
-                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    .build()
-            }
-        }.setEnableDecoderFallback(true)
-
-        ExoPlayer.Builder(context, renderersFactory)
-            .setMediaSourceFactory(mediaSourceFactory)
-            .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
-            .build()
-            .apply {
-                repeatMode = Player.REPEAT_MODE_ONE
-                playWhenReady = isPlaying
-                volume = computeTargetVolume(isMuted = isMuted, isAudioDucked = isAudioDucked)
-            }
-    }
-
-    val isPlayerReleased = remember(exoPlayer) { AtomicBoolean(false) }
-
-    DisposableEffect(exoPlayer) {
+    DisposableEffect(exoPlayer, playerManager) {
         val listener = object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 videoWidth = videoSize.width
                 videoHeight = videoSize.height
                 textureViewRef?.let { tv ->
-                    applyTextureScaleMatrix(tv, videoSize.width, videoSize.height, scaleMode)
+                    applyTextureScaleMatrix(
+                        textureView = tv,
+                        videoWidth = videoSize.width,
+                        videoHeight = videoSize.height,
+                        scaleMode = currentScaleMode,
+                        matrix = reusableMatrix
+                    )
                 }
             }
 
@@ -203,24 +148,22 @@ fun ExoVideoPlayerView(
         }
         exoPlayer.addListener(listener)
         onDispose {
-            if (isPlayerReleased.compareAndSet(false, true)) {
-                runCatching { exoPlayer.removeListener(listener) }
-                runCatching { exoPlayer.stop() }
-                runCatching { exoPlayer.clearMediaItems() }
-                runCatching { exoPlayer.clearVideoTextureView(textureViewRef) }
-                runCatching { exoPlayer.release() }
-            }
+            runCatching { exoPlayer.removeListener(listener) }
+            val tv = textureViewRef
+            textureViewRef = null
+            playerManager.detachGameplayTextureView(tv)
         }
     }
 
-    LaunchedEffect(trackSelector, qualityPreference) {
-        runCatching {
-            trackSelector.setParameters(buildMin720pTrackParameters(trackSelector, qualityPreference))
-        }
+    LaunchedEffect(playerManager, headers) {
+        playerManager.updateGameplayHeaders(headers)
+    }
+
+    LaunchedEffect(playerManager, qualityPreference) {
+        playerManager.updateGameplayQuality(qualityPreference)
     }
 
     LaunchedEffect(exoPlayer, sourceUriOrUrl, reloadNonce) {
-        if (isPlayerReleased.get()) return@LaunchedEffect
         runCatching {
             if (sourceUriOrUrl.isBlank()) {
                 exoPlayer.stop()
@@ -238,16 +181,16 @@ fun ExoVideoPlayerView(
             } else {
                 Uri.parse(sourceUriOrUrl)
             }
-            exoPlayer.stop()
-            exoPlayer.clearMediaItems()
-            exoPlayer.setMediaItem(MediaItem.fromUri(uri))
-            exoPlayer.prepare()
-            exoPlayer.playWhenReady = isPlaying
+            playerManager.loadGameplayMedia(
+                player = exoPlayer,
+                loadKey = "$reloadNonce|$sourceUriOrUrl",
+                mediaItem = MediaItem.fromUri(uri),
+                playWhenReady = isPlaying
+            )
         }
     }
 
     LaunchedEffect(exoPlayer, isPlaying) {
-        if (isPlayerReleased.get()) return@LaunchedEffect
         runCatching {
             exoPlayer.playWhenReady = isPlaying
             if (isPlaying && exoPlayer.playbackState == Player.STATE_IDLE && exoPlayer.mediaItemCount > 0) {
@@ -257,19 +200,18 @@ fun ExoVideoPlayerView(
     }
 
     LaunchedEffect(exoPlayer, isMuted, isAudioDucked) {
-        if (isPlayerReleased.get()) return@LaunchedEffect
         runCatching {
             exoPlayer.volume = computeTargetVolume(isMuted = isMuted, isAudioDucked = isAudioDucked)
         }
     }
 
-    LaunchedEffect(voiceReduceEnabled) {
-        voiceProcessor.enabled = voiceReduceEnabled
+    LaunchedEffect(playerManager, voiceReduceEnabled) {
+        playerManager.gameplayVoiceProcessor.enabled = voiceReduceEnabled
     }
 
     LaunchedEffect(scaleMode, videoWidth, videoHeight, textureViewRef) {
         textureViewRef?.let { tv ->
-            applyTextureScaleMatrix(tv, videoWidth, videoHeight, scaleMode)
+            applyTextureScaleMatrix(tv, videoWidth, videoHeight, scaleMode, reusableMatrix)
         }
     }
 
@@ -288,7 +230,13 @@ fun ExoVideoPlayerView(
                         width: Int,
                         height: Int
                     ) {
-                        applyTextureScaleMatrix(this@apply, videoWidth, videoHeight, scaleMode)
+                        applyTextureScaleMatrix(
+                            this@apply,
+                            videoWidth,
+                            videoHeight,
+                            currentScaleMode,
+                            reusableMatrix
+                        )
                     }
 
                     override fun onSurfaceTextureSizeChanged(
@@ -296,7 +244,13 @@ fun ExoVideoPlayerView(
                         width: Int,
                         height: Int
                     ) {
-                        applyTextureScaleMatrix(this@apply, videoWidth, videoHeight, scaleMode)
+                        applyTextureScaleMatrix(
+                            this@apply,
+                            videoWidth,
+                            videoHeight,
+                            currentScaleMode,
+                            reusableMatrix
+                        )
                     }
 
                     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
@@ -304,18 +258,22 @@ fun ExoVideoPlayerView(
                     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
                 }
                 addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-                    applyTextureScaleMatrix(this, videoWidth, videoHeight, scaleMode)
+                    applyTextureScaleMatrix(
+                        this,
+                        videoWidth,
+                        videoHeight,
+                        currentScaleMode,
+                        reusableMatrix
+                    )
                 }
-                exoPlayer.setVideoTextureView(this)
+                playerManager.attachGameplayTextureView(exoPlayer, this)
                 textureViewRef = this
             }
         },
         update = { tv ->
-            if (textureViewRef !== tv) {
-                exoPlayer.setVideoTextureView(tv)
-                textureViewRef = tv
-            }
-            applyTextureScaleMatrix(tv, videoWidth, videoHeight, scaleMode)
+            playerManager.attachGameplayTextureView(exoPlayer, tv)
+            textureViewRef = tv
+            applyTextureScaleMatrix(tv, videoWidth, videoHeight, scaleMode, reusableMatrix)
         }
     )
 }
@@ -326,46 +284,12 @@ private fun computeTargetVolume(isMuted: Boolean, isAudioDucked: Boolean): Float
     else -> 1f
 }
 
-@OptIn(UnstableApi::class)
-private fun buildMin720pTrackParameters(
-    trackSelector: DefaultTrackSelector,
-    qualityPreference: VideoQualityPreference
-): DefaultTrackSelector.Parameters {
-    val builder = trackSelector.buildUponParameters()
-        // Fallback to best available quality if stream has no 720p+ variant
-        .setExceedVideoConstraintsIfNecessary(true)
-        .setExceedRendererCapabilitiesIfNecessary(true)
-
-    when (qualityPreference) {
-        VideoQualityPreference.AUTO_720P_MIN -> {
-            builder
-                .setMinVideoSize(1280, 720)
-                .setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
-                .setForceHighestSupportedBitrate(true)
-        }
-
-        VideoQualityPreference.FORCE_1080P -> {
-            builder
-                .setMinVideoSize(1920, 1080)
-                .setMaxVideoSize(1920, 1080)
-                .setForceHighestSupportedBitrate(true)
-        }
-
-        VideoQualityPreference.FORCE_720P -> {
-            builder
-                .setMinVideoSize(1280, 720)
-                .setMaxVideoSize(1280, 720)
-                .setForceHighestSupportedBitrate(true)
-        }
-    }
-    return builder.build()
-}
-
 private fun applyTextureScaleMatrix(
     textureView: TextureView,
     videoWidth: Int,
     videoHeight: Int,
-    scaleMode: DisplayScaleMode
+    scaleMode: DisplayScaleMode,
+    matrix: Matrix
 ) {
     val viewWidth = textureView.width.toFloat()
     val viewHeight = textureView.height.toFloat()
@@ -374,7 +298,7 @@ private fun applyTextureScaleMatrix(
         return
     }
 
-    val matrix = Matrix()
+    matrix.reset()
     if (scaleMode == DisplayScaleMode.STRETCH) {
         textureView.setTransform(matrix)
         return

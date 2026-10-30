@@ -64,6 +64,16 @@ class MainActivity : ComponentActivity() {
         handleIncomingShareIntent(intent)
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        runCatching { viewModel.onTrimMemory(level) }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        runCatching { viewModel.onLowMemory() }
+    }
+
     private fun handleIncomingShareIntent(intent: Intent?) {
         runCatching {
             if (intent?.action != Intent.ACTION_SEND) return

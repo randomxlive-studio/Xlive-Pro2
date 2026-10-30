@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -27,7 +28,8 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 
 /**
  * Fallback comment reader using MediaProjection + free offline ML Kit Text Recognition,
- * throttled to 1 capture every 2.5 seconds and executed ONLY when Accessibility yields no comments.
+ * throttled to 1 capture every 3 seconds, reusing a single capture Bitmap buffer,
+ * and recycling cropped Bitmaps immediately after OCR completes.
  */
 class TikTokOcrFallbackService : Service() {
 
@@ -36,7 +38,7 @@ class TikTokOcrFallbackService : Service() {
         private const val NOTIFICATION_ID = 4402
         private const val EXTRA_RESULT_CODE = "extra_result_code"
         private const val EXTRA_RESULT_DATA = "extra_result_data"
-        private const val CAPTURE_INTERVAL_MS = 2500L
+        private const val CAPTURE_INTERVAL_MS = 3000L
 
         fun createStartIntent(context: Context, resultCode: Int, data: Intent): Intent {
             return Intent(context, TikTokOcrFallbackService::class.java).apply {
@@ -54,6 +56,7 @@ class TikTokOcrFallbackService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private var reusableCaptureBitmap: Bitmap? = null
     private var isCaptureInFlight = false
 
     private val captureRunnable = object : Runnable {
@@ -94,8 +97,9 @@ class TikTokOcrFallbackService : Service() {
     private fun setupVirtualDisplay(resultCode: Int, resultData: Intent) {
         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val metrics = resources.displayMetrics
-        val captureW = (metrics.widthPixels / 2).coerceAtLeast(360)
-        val captureH = (metrics.heightPixels / 2).coerceAtLeast(640)
+        // Modest resolution keeps reusable capture buffer small (~1MB instead of ~8MB)
+        val captureW = (metrics.widthPixels / 2).coerceIn(320, 540)
+        val captureH = (metrics.heightPixels / 2).coerceIn(560, 1100)
         val density = metrics.densityDpi
 
         tearDownProjection()
@@ -127,11 +131,36 @@ class TikTokOcrFallbackService : Service() {
         virtualDisplay = vDisplay
     }
 
+    private fun obtainReusableCaptureBitmap(targetW: Int, targetH: Int): Bitmap {
+        val existing = reusableCaptureBitmap
+        if (existing != null &&
+            !existing.isRecycled &&
+            existing.width == targetW &&
+            existing.height == targetH
+        ) {
+            return existing
+        }
+        existing?.let { bmp ->
+            if (!bmp.isRecycled) runCatching { bmp.recycle() }
+        }
+        val created = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        reusableCaptureBitmap = created
+        return created
+    }
+
+    private fun recycleReusableBuffer() {
+        reusableCaptureBitmap?.let { bmp ->
+            if (!bmp.isRecycled) runCatching { bmp.recycle() }
+        }
+        reusableCaptureBitmap = null
+    }
+
     private fun captureAndRecognizeCommentArea() {
         val reader = imageReader ?: return
         val image = runCatching { reader.acquireLatestImage() }.getOrNull() ?: return
         isCaptureInFlight = true
 
+        var croppedBitmap: Bitmap? = null
         try {
             val plane = image.planes.firstOrNull()
             if (plane == null) {
@@ -144,13 +173,12 @@ class TikTokOcrFallbackService : Service() {
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
             val rowPadding = rowStride - pixelStride * width
+            val bufferWidth = width + (rowPadding / pixelStride).coerceAtLeast(0)
 
-            val fullBitmap = Bitmap.createBitmap(
-                width + rowPadding / pixelStride,
-                height,
-                Bitmap.Config.ARGB_8888
-            )
-            fullBitmap.copyPixelsFromBuffer(plane.buffer)
+            val fullBitmap = obtainReusableCaptureBitmap(bufferWidth, height)
+            val byteBuffer = plane.buffer
+            byteBuffer.rewind()
+            fullBitmap.copyPixelsFromBuffer(byteBuffer)
             image.close()
 
             // Crop strictly to TikTok LIVE bottom-left comment stream area (50%..88% height, 0..78% width)
@@ -159,10 +187,10 @@ class TikTokOcrFallbackService : Service() {
             val cropW = (width * 0.78f).toInt().coerceIn(10, width)
             val cropH = (height * 0.38f).toInt().coerceIn(10, height - cropY)
 
-            val croppedBitmap = Bitmap.createBitmap(fullBitmap, cropX, cropY, cropW, cropH)
-            fullBitmap.recycle()
+            val crop = Bitmap.createBitmap(fullBitmap, cropX, cropY, cropW, cropH)
+            croppedBitmap = crop
 
-            val inputImage = InputImage.fromBitmap(croppedBitmap, 0)
+            val inputImage = InputImage.fromBitmap(crop, 0)
             recognizer.process(inputImage)
                 .addOnSuccessListener { visionText ->
                     for (block in visionText.textBlocks) {
@@ -186,12 +214,31 @@ class TikTokOcrFallbackService : Service() {
                     }
                 }
                 .addOnCompleteListener {
-                    croppedBitmap.recycle()
+                    if (!crop.isRecycled) {
+                        runCatching { crop.recycle() }
+                    }
                     isCaptureInFlight = false
                 }
         } catch (_: Throwable) {
             runCatching { image.close() }
+            croppedBitmap?.let { bmp ->
+                if (!bmp.isRecycled) runCatching { bmp.recycle() }
+            }
             isCaptureInFlight = false
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && !isCaptureInFlight) {
+            recycleReusableBuffer()
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        if (!isCaptureInFlight) {
+            recycleReusableBuffer()
         }
     }
 
@@ -230,6 +277,7 @@ class TikTokOcrFallbackService : Service() {
         imageReader = null
         runCatching { mediaProjection?.stop() }
         mediaProjection = null
+        recycleReusableBuffer()
     }
 
     override fun onDestroy() {

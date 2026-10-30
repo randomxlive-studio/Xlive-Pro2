@@ -57,11 +57,9 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import com.example.R
+import com.example.engine.StudioExoPlayerManager
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.NeonEmerald
 import com.example.ui.theme.NeonPink
@@ -117,42 +115,39 @@ private class CircularHostContainer(context: Context) : FrameLayout(context) {
     }
 }
 
-@OptIn(UnstableApi::class)
-private class ActiveCharacterVideoSession(
-    val player: ExoPlayer,
-    val textureView: TextureView,
-    val playerListener: Player.Listener,
-    val layoutListener: View.OnLayoutChangeListener
-) {
-    val isReleased = AtomicBoolean(false)
-
-    @Volatile
-    var videoWidth: Int = 0
-
-    @Volatile
-    var videoHeight: Int = 0
-}
-
 /**
- * Main-thread controller that guarantees:
- * 1. Camera and Video NEVER run at the same time (previous mode is 100% released before next starts).
- * 2. Safe video switching: `player.stop()`, `player.clearMediaItems()`, `player.release()`,
- *    detach & remove old `TextureView`, then create a fresh player & attach on Main thread.
- * 3. Null and double-release safety via `AtomicBoolean` + defensive `try/catch`.
- * 4. Persistent circular outline clipping on host + child surfaces after every switch.
+ * Main-thread circular media controller that reuses:
+ * 1. The ViewModel-managed `StudioExoPlayerManager` character player (`setMediaItem` + `prepare` on
+ *    video change; full `releaseCharacterPlayer()` on Reset or when switching to Camera).
+ * 2. A single cached `ProcessCameraProvider` (`bindToLifecycle` once per active camera state;
+ *    `unbindAll()` immediately when switching away or pressing Reset circle).
+ * 3. A single reusable `TextureView` for video and `PreviewView` (`COMPATIBLE`) for camera,
+ *    preserving circular clipping after every switch and reset.
  */
 @OptIn(UnstableApi::class)
 private class CharacterCircleMediaController(
-    private val appContext: Context
+    private val appContext: Context,
+    private val playerManager: StudioExoPlayerManager
 ) {
     private var hostContainer: CircularHostContainer? = null
     private var currentTarget: CharacterMediaTarget = CharacterMediaTarget.None
     private var switchGeneration: Long = 0L
     private var isDisposed: Boolean = false
 
-    private var activeVideoSession: ActiveCharacterVideoSession? = null
+    private var videoTextureView: TextureView? = null
+    private var attachedPlayer: ExoPlayer? = null
+    private var attachedListener: Player.Listener? = null
+    private val reusableCropMatrix = Matrix()
+
+    @Volatile
+    private var videoWidth: Int = 0
+
+    @Volatile
+    private var videoHeight: Int = 0
+
     private var activePreviewView: PreviewView? = null
-    private var boundCameraProvider: ProcessCameraProvider? = null
+    private var cachedCameraProvider: ProcessCameraProvider? = null
+    private val isCameraBound = AtomicBoolean(false)
 
     private var desiredIsPlaying: Boolean = true
     private var desiredIsMuted: Boolean = true
@@ -166,19 +161,14 @@ private class CharacterCircleMediaController(
     fun updatePlaybackControls(isPlaying: Boolean, isMuted: Boolean) {
         desiredIsPlaying = isPlaying
         desiredIsMuted = isMuted
-        val session = activeVideoSession ?: return
-        if (session.isReleased.get()) return
+        val player = attachedPlayer ?: return
         try {
-            session.player.volume = if (isMuted) 0f else 1f
-            session.player.playWhenReady = isPlaying
-            if (isPlaying &&
-                session.player.playbackState == Player.STATE_IDLE &&
-                session.player.mediaItemCount > 0
-            ) {
-                session.player.prepare()
+            player.volume = if (isMuted) 0f else 1f
+            player.playWhenReady = isPlaying
+            if (isPlaying && player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+                player.prepare()
             }
         } catch (_: Throwable) {
-            // Ignore transient state race if player is mid-release
         }
     }
 
@@ -203,15 +193,13 @@ private class CharacterCircleMediaController(
 
         val alreadyActiveAndHealthy = when (target) {
             is CharacterMediaTarget.None -> currentTarget == CharacterMediaTarget.None &&
-                activeVideoSession == null && activePreviewView == null
+                attachedPlayer == null && activePreviewView == null && !isCameraBound.get()
 
             is CharacterMediaTarget.Camera -> currentTarget == target &&
-                activePreviewView != null && activeVideoSession == null
+                activePreviewView != null && attachedPlayer == null && isCameraBound.get()
 
             is CharacterMediaTarget.Video -> currentTarget == target &&
-                activeVideoSession != null &&
-                activeVideoSession?.isReleased?.get() == false &&
-                activePreviewView == null
+                attachedPlayer != null && videoTextureView?.parent === host && !isCameraBound.get()
         }
 
         if (alreadyActiveAndHealthy) {
@@ -224,27 +212,21 @@ private class CharacterCircleMediaController(
         currentTarget = target
 
         try {
-            // STEP 1: Strictly release Camera first if it was running or pending
-            releaseCameraSafely(host)
-
-            // STEP 2: Strictly stop, clear, & release previous ExoPlayer and remove old TextureView
-            releaseVideoSessionSafely(host)
-
-            // Ensure no orphaned surface views remain inside the circle container
-            try {
-                host.removeAllViews()
-            } catch (_: Throwable) {
-            }
-            enforceCircularOutline(host)
-
-            // STEP 3: Start ONLY the requested target on the Main thread
             when (target) {
-                is CharacterMediaTarget.None -> Unit
+                is CharacterMediaTarget.None -> {
+                    unbindCameraSafely(host)
+                    detachVideoViewSafely(host, releasePlayerMemory = false)
+                    runCatching { host.removeAllViews() }
+                    enforceCircularOutline(host)
+                }
 
                 is CharacterMediaTarget.Video -> {
-                    startVideoOnMain(
+                    // Camera and Video NEVER run at the same time: unbind CameraX completely first
+                    unbindCameraSafely(host)
+                    startOrSwitchVideoOnMain(
                         host = host,
                         localFilePath = target.localFilePath,
+                        switchNonce = target.switchNonce,
                         generation = myGeneration,
                         onVideoError = onVideoError,
                         onMissingVideoFile = onMissingVideoFile
@@ -252,6 +234,8 @@ private class CharacterCircleMediaController(
                 }
 
                 is CharacterMediaTarget.Camera -> {
+                    // Camera and Video NEVER run at the same time: release video player completely first
+                    detachVideoViewSafely(host, releasePlayerMemory = true)
                     startCameraOnMain(
                         host = host,
                         isFrontCamera = target.isFrontCamera,
@@ -262,8 +246,8 @@ private class CharacterCircleMediaController(
                 }
             }
         } catch (t: Throwable) {
-            releaseCameraSafely(host)
-            releaseVideoSessionSafely(host)
+            unbindCameraSafely(host)
+            detachVideoViewSafely(host, releasePlayerMemory = true)
             currentTarget = CharacterMediaTarget.None
             val message = t.localizedMessage ?: t.javaClass.simpleName
             showSafeToast(appContext.getString(R.string.character_video_error_toast, message))
@@ -271,148 +255,145 @@ private class CharacterCircleMediaController(
         }
     }
 
-    private fun startVideoOnMain(
+    private fun startOrSwitchVideoOnMain(
         host: CircularHostContainer,
         localFilePath: String,
+        switchNonce: Long,
         generation: Long,
         onVideoError: (String) -> Unit,
         onMissingVideoFile: () -> Unit
     ) {
         val videoFile = File(localFilePath)
         if (!videoFile.exists() || !videoFile.isFile || videoFile.length() <= 0L) {
+            detachVideoViewSafely(host, releasePlayerMemory = true)
             currentTarget = CharacterMediaTarget.None
             onMissingVideoFile()
             return
         }
 
-        val textureView = TextureView(host.context).apply {
+        // Reuse the ViewModel-managed ExoPlayer and reusable TextureView across video changes
+        val exoPlayer = playerManager.getOrCreateCharacterPlayer()
+        val textureView = getOrCreateCircularTextureView(host)
+
+        if (attachedPlayer !== exoPlayer) {
+            detachCurrentPlayerListener()
+            val listener = object : Player.Listener {
+                override fun onVideoSizeChanged(videoSize: VideoSize) {
+                    if (isDisposed || generation > switchGeneration) return
+                    videoWidth = videoSize.width
+                    videoHeight = videoSize.height
+                    videoTextureView?.let { tv ->
+                        enforceCircularOutline(tv)
+                        applyCenterCropMatrix(tv, videoSize.width, videoSize.height, reusableCropMatrix)
+                    }
+                    enforceCircularOutline(host)
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    if (isDisposed) return
+                    val detail = buildString {
+                        append(error.errorCodeName)
+                        val causeMsg = error.cause?.localizedMessage ?: error.localizedMessage
+                        if (!causeMsg.isNullOrBlank() && !causeMsg.contains(error.errorCodeName)) {
+                            append(" - ")
+                            append(causeMsg.take(90))
+                        }
+                    }
+                    showSafeToast(appContext.getString(R.string.character_video_error_toast, detail))
+                    detachVideoViewSafely(hostContainer, releasePlayerMemory = true)
+                    currentTarget = CharacterMediaTarget.None
+                    onVideoError(detail)
+                }
+            }
+            exoPlayer.addListener(listener)
+            attachedPlayer = exoPlayer
+            attachedListener = listener
+        }
+
+        try {
+            if (textureView.parent !== host) {
+                (textureView.parent as? ViewGroup)?.removeView(textureView)
+                host.removeAllViews()
+                host.addView(textureView)
+            }
+            enforceCircularOutline(textureView)
+            enforceCircularOutline(host)
+
+            playerManager.attachCharacterTextureView(exoPlayer, textureView)
+            playerManager.loadCharacterMedia(
+                player = exoPlayer,
+                loadKey = "$switchNonce|$localFilePath",
+                mediaItem = MediaItem.fromUri(Uri.fromFile(videoFile)),
+                playWhenReady = desiredIsPlaying,
+                isMuted = desiredIsMuted
+            )
+
+            val currentVideoSize = exoPlayer.videoSize
+            if (currentVideoSize.width > 0 && currentVideoSize.height > 0) {
+                videoWidth = currentVideoSize.width
+                videoHeight = currentVideoSize.height
+                applyCenterCropMatrix(
+                    textureView,
+                    currentVideoSize.width,
+                    currentVideoSize.height,
+                    reusableCropMatrix
+                )
+            }
+        } catch (t: Throwable) {
+            detachVideoViewSafely(host, releasePlayerMemory = true)
+            currentTarget = CharacterMediaTarget.None
+            val message = t.localizedMessage ?: t.javaClass.simpleName
+            showSafeToast(appContext.getString(R.string.character_video_error_toast, message))
+            onVideoError(message)
+        }
+    }
+
+    private fun getOrCreateCircularTextureView(host: CircularHostContainer): TextureView {
+        val existing = videoTextureView
+        if (existing != null && existing.context === host.context) {
+            enforceCircularOutline(existing)
+            return existing
+        }
+
+        val tv = TextureView(host.context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             isOpaque = false
             enforceCircularOutline(this)
-        }
-
-        val renderersFactory = DefaultRenderersFactory(appContext)
-            .setEnableDecoderFallback(true)
-
-        val trackSelector = DefaultTrackSelector(appContext).apply {
-            setParameters(
-                buildUponParameters()
-                    .setExceedVideoConstraintsIfNecessary(true)
-                    .setExceedRendererCapabilitiesIfNecessary(true)
-                    .build()
-            )
-        }
-
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                2_000,
-                12_000,
-                400,
-                800
-            )
-            .build()
-
-        val exoPlayer = ExoPlayer.Builder(appContext, renderersFactory)
-            .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
-            .build()
-
-        lateinit var sessionRef: ActiveCharacterVideoSession
-
-        val layoutListener = View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
-            if (!sessionRef.isReleased.get() && view is TextureView) {
-                enforceCircularOutline(view)
-                applyCenterCropMatrix(view, sessionRef.videoWidth, sessionRef.videoHeight)
-            }
-        }
-
-        val playerListener = object : Player.Listener {
-            override fun onVideoSizeChanged(videoSize: VideoSize) {
-                if (isDisposed || generation != switchGeneration || sessionRef.isReleased.get()) return
-                sessionRef.videoWidth = videoSize.width
-                sessionRef.videoHeight = videoSize.height
-                enforceCircularOutline(textureView)
-                enforceCircularOutline(host)
-                applyCenterCropMatrix(textureView, videoSize.width, videoSize.height)
-            }
-
-            override fun onPlayerError(error: PlaybackException) {
-                if (isDisposed || generation != switchGeneration) return
-                val detail = buildString {
-                    append(error.errorCodeName)
-                    val causeMsg = error.cause?.localizedMessage ?: error.localizedMessage
-                    if (!causeMsg.isNullOrBlank() && !causeMsg.contains(error.errorCodeName)) {
-                        append(" - ")
-                        append(causeMsg.take(90))
-                    }
-                }
-                showSafeToast(appContext.getString(R.string.character_video_error_toast, detail))
-                releaseVideoSessionSafely(hostContainer)
-                currentTarget = CharacterMediaTarget.None
-                onVideoError(detail)
-            }
-        }
-
-        sessionRef = ActiveCharacterVideoSession(
-            player = exoPlayer,
-            textureView = textureView,
-            playerListener = playerListener,
-            layoutListener = layoutListener
-        )
-
-        textureView.addOnLayoutChangeListener(layoutListener)
-        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(
-                surface: SurfaceTexture,
-                width: Int,
-                height: Int
-            ) {
-                if (!sessionRef.isReleased.get()) {
-                    enforceCircularOutline(textureView)
-                    applyCenterCropMatrix(textureView, sessionRef.videoWidth, sessionRef.videoHeight)
+            addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                if (v is TextureView) {
+                    enforceCircularOutline(v)
+                    applyCenterCropMatrix(v, videoWidth, videoHeight, reusableCropMatrix)
                 }
             }
-
-            override fun onSurfaceTextureSizeChanged(
-                surface: SurfaceTexture,
-                width: Int,
-                height: Int
-            ) {
-                if (!sessionRef.isReleased.get()) {
-                    enforceCircularOutline(textureView)
-                    applyCenterCropMatrix(textureView, sessionRef.videoWidth, sessionRef.videoHeight)
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int
+                ) {
+                    enforceCircularOutline(this@apply)
+                    applyCenterCropMatrix(this@apply, videoWidth, videoHeight, reusableCropMatrix)
                 }
+
+                override fun onSurfaceTextureSizeChanged(
+                    surface: SurfaceTexture,
+                    width: Int,
+                    height: Int
+                ) {
+                    enforceCircularOutline(this@apply)
+                    applyCenterCropMatrix(this@apply, videoWidth, videoHeight, reusableCropMatrix)
+                }
+
+                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
+
+                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
             }
-
-            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-
-            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
         }
-
-        activeVideoSession = sessionRef
-
-        try {
-            host.addView(textureView)
-            enforceCircularOutline(textureView)
-            enforceCircularOutline(host)
-
-            exoPlayer.addListener(playerListener)
-            exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
-            exoPlayer.volume = if (desiredIsMuted) 0f else 1f
-            exoPlayer.setVideoTextureView(textureView)
-            exoPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(videoFile)))
-            exoPlayer.prepare()
-            exoPlayer.playWhenReady = desiredIsPlaying
-        } catch (t: Throwable) {
-            releaseVideoSessionSafely(host)
-            currentTarget = CharacterMediaTarget.None
-            val message = t.localizedMessage ?: t.javaClass.simpleName
-            showSafeToast(appContext.getString(R.string.character_video_error_toast, message))
-            onVideoError(message)
-        }
+        videoTextureView = tv
+        return tv
     }
 
     private fun startCameraOnMain(
@@ -435,69 +416,61 @@ private class CharacterCircleMediaController(
             return
         }
 
-        val previewView = PreviewView(host.context).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            // COMPATIBLE uses TextureView instead of SurfaceView so circular outline clipping
-            // always stays intact and never punches a rectangle through Compose layers.
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-            enforceCircularOutline(this)
-            addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-                enforceCircularOutline(v)
+        val previewView = activePreviewView?.takeIf { it.context === host.context }
+            ?: PreviewView(host.context).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+                enforceCircularOutline(this)
+                addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                    enforceCircularOutline(v)
+                }
             }
-        }
 
-        host.addView(previewView)
+        if (previewView.parent !== host) {
+            (previewView.parent as? ViewGroup)?.removeView(previewView)
+            host.removeAllViews()
+            host.addView(previewView)
+        }
         enforceCircularOutline(previewView)
         enforceCircularOutline(host)
         activePreviewView = previewView
 
+        val cached = cachedCameraProvider
+        if (cached != null) {
+            bindCameraProviderOnce(
+                provider = cached,
+                previewView = previewView,
+                host = host,
+                isFrontCamera = isFrontCamera,
+                lifecycleOwner = lifecycleOwner,
+                generation = generation,
+                onCameraError = onCameraError
+            )
+            return
+        }
+
         val cameraProviderFuture = ProcessCameraProvider.getInstance(appContext)
         val mainExecutor = ContextCompat.getMainExecutor(appContext)
-
         cameraProviderFuture.addListener(
             {
                 try {
                     val provider = cameraProviderFuture.get()
-                    if (isDisposed || generation != switchGeneration || activePreviewView !== previewView) {
-                        // Switched away before async CameraX provider resolved — make sure camera stays unbound
-                        runCatching { provider.unbindAll() }
-                        return@addListener
-                    }
-
-                    provider.unbindAll()
-
-                    val preferredSelector = if (isFrontCamera) {
-                        CameraSelector.DEFAULT_FRONT_CAMERA
-                    } else {
-                        CameraSelector.DEFAULT_BACK_CAMERA
-                    }
-                    val fallbackSelector = if (isFrontCamera) {
-                        CameraSelector.DEFAULT_BACK_CAMERA
-                    } else {
-                        CameraSelector.DEFAULT_FRONT_CAMERA
-                    }
-                    val resolvedSelector = when {
-                        runCatching { provider.hasCamera(preferredSelector) }.getOrDefault(false) ->
-                            preferredSelector
-                        runCatching { provider.hasCamera(fallbackSelector) }.getOrDefault(false) ->
-                            fallbackSelector
-                        else -> preferredSelector
-                    }
-
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = previewView.surfaceProvider
-                    }
-
-                    provider.bindToLifecycle(lifecycleOwner, resolvedSelector, preview)
-                    boundCameraProvider = provider
-                    enforceCircularOutline(previewView)
-                    enforceCircularOutline(host)
+                    cachedCameraProvider = provider
+                    bindCameraProviderOnce(
+                        provider = provider,
+                        previewView = previewView,
+                        host = host,
+                        isFrontCamera = isFrontCamera,
+                        lifecycleOwner = lifecycleOwner,
+                        generation = generation,
+                        onCameraError = onCameraError
+                    )
                 } catch (t: Throwable) {
-                    releaseCameraSafely(hostContainer)
+                    unbindCameraSafely(hostContainer)
                     currentTarget = CharacterMediaTarget.None
                     val msg = t.localizedMessage ?: t.javaClass.simpleName
                     showSafeToast(appContext.getString(R.string.character_camera_error_toast, msg))
@@ -508,75 +481,109 @@ private class CharacterCircleMediaController(
         )
     }
 
-    private fun releaseVideoSessionSafely(host: CircularHostContainer?) {
-        val session = activeVideoSession
-        activeVideoSession = null
-        if (session != null && session.isReleased.compareAndSet(false, true)) {
-            try {
-                session.textureView.removeOnLayoutChangeListener(session.layoutListener)
-            } catch (_: Throwable) {
+    private fun bindCameraProviderOnce(
+        provider: ProcessCameraProvider,
+        previewView: PreviewView,
+        host: CircularHostContainer,
+        isFrontCamera: Boolean,
+        lifecycleOwner: LifecycleOwner,
+        generation: Long,
+        onCameraError: (String) -> Unit
+    ) {
+        if (isDisposed || generation != switchGeneration || activePreviewView !== previewView) {
+            runCatching { provider.unbindAll() }
+            isCameraBound.set(false)
+            return
+        }
+
+        try {
+            provider.unbindAll()
+            val preferredSelector = if (isFrontCamera) {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            } else {
+                CameraSelector.DEFAULT_BACK_CAMERA
             }
-            try {
-                session.textureView.surfaceTextureListener = null
-            } catch (_: Throwable) {
+            val fallbackSelector = if (isFrontCamera) {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            } else {
+                CameraSelector.DEFAULT_FRONT_CAMERA
             }
-            try {
-                session.player.removeListener(session.playerListener)
-            } catch (_: Throwable) {
+            val resolvedSelector = when {
+                runCatching { provider.hasCamera(preferredSelector) }.getOrDefault(false) ->
+                    preferredSelector
+                runCatching { provider.hasCamera(fallbackSelector) }.getOrDefault(false) ->
+                    fallbackSelector
+                else -> preferredSelector
             }
-            try {
-                session.player.playWhenReady = false
-                session.player.stop()
-            } catch (_: Throwable) {
+
+            val preview = Preview.Builder().build().also {
+                it.surfaceProvider = previewView.surfaceProvider
             }
-            try {
-                session.player.clearMediaItems()
-            } catch (_: Throwable) {
-            }
-            try {
-                session.player.clearVideoTextureView(session.textureView)
-                session.player.setVideoSurface(null)
-            } catch (_: Throwable) {
-            }
-            try {
-                session.player.release()
-            } catch (_: Throwable) {
-            }
-            try {
-                (session.textureView.parent as? ViewGroup)?.removeView(session.textureView)
-                host?.removeView(session.textureView)
-            } catch (_: Throwable) {
-            }
+
+            provider.bindToLifecycle(lifecycleOwner, resolvedSelector, preview)
+            isCameraBound.set(true)
+            enforceCircularOutline(previewView)
+            enforceCircularOutline(host)
+        } catch (t: Throwable) {
+            unbindCameraSafely(hostContainer)
+            currentTarget = CharacterMediaTarget.None
+            val msg = t.localizedMessage ?: t.javaClass.simpleName
+            showSafeToast(appContext.getString(R.string.character_camera_error_toast, msg))
+            onCameraError(msg)
         }
     }
 
-    private fun releaseCameraSafely(host: CircularHostContainer?) {
+    private fun detachCurrentPlayerListener() {
+        val player = attachedPlayer
+        val listener = attachedListener
+        attachedPlayer = null
+        attachedListener = null
+        if (player != null && listener != null) {
+            runCatching { player.removeListener(listener) }
+        }
+    }
+
+    private fun detachVideoViewSafely(
+        host: CircularHostContainer?,
+        releasePlayerMemory: Boolean
+    ) {
+        val tv = videoTextureView
+        detachCurrentPlayerListener()
+        playerManager.detachCharacterTextureView(tv)
+        if (releasePlayerMemory) {
+            playerManager.releaseCharacterPlayer()
+            videoWidth = 0
+            videoHeight = 0
+        }
+        if (tv != null) {
+            runCatching { (tv.parent as? ViewGroup)?.removeView(tv) }
+            runCatching { host?.removeView(tv) }
+        }
+    }
+
+    private fun unbindCameraSafely(host: CircularHostContainer?) {
+        isCameraBound.set(false)
         val preview = activePreviewView
         activePreviewView = null
 
-        val provider = boundCameraProvider
-        boundCameraProvider = null
+        val provider = cachedCameraProvider
         if (provider != null) {
-            try {
-                provider.unbindAll()
-            } catch (_: Throwable) {
-            }
+            runCatching { provider.unbindAll() }
         } else {
-            try {
+            runCatching {
                 val future = ProcessCameraProvider.getInstance(appContext)
                 if (future.isDone) {
-                    future.get().unbindAll()
+                    val resolved = future.get()
+                    cachedCameraProvider = resolved
+                    resolved.unbindAll()
                 }
-            } catch (_: Throwable) {
             }
         }
 
         if (preview != null) {
-            try {
-                (preview.parent as? ViewGroup)?.removeView(preview)
-                host?.removeView(preview)
-            } catch (_: Throwable) {
-            }
+            runCatching { preview.surfaceProvider }
+            runCatching { (preview.parent as? ViewGroup)?.removeView(preview) }
+            runCatching { host?.removeView(preview) }
         }
     }
 
@@ -585,12 +592,13 @@ private class CharacterCircleMediaController(
         isDisposed = true
         switchGeneration++
         currentTarget = CharacterMediaTarget.None
-        releaseCameraSafely(hostContainer)
-        releaseVideoSessionSafely(hostContainer)
-        try {
-            hostContainer?.removeAllViews()
-        } catch (_: Throwable) {
-        }
+        unbindCameraSafely(hostContainer)
+        // Detach surface on recomposition/orientation change without destroying ViewModel player;
+        // ViewModel.onCleared() and Reset Circle handle full player release.
+        detachVideoViewSafely(hostContainer, releasePlayerMemory = false)
+        videoTextureView?.surfaceTextureListener = null
+        videoTextureView = null
+        runCatching { hostContainer?.removeAllViews() }
         hostContainer = null
     }
 
@@ -605,7 +613,8 @@ private class CharacterCircleMediaController(
 private fun applyCenterCropMatrix(
     textureView: TextureView,
     videoWidth: Int,
-    videoHeight: Int
+    videoHeight: Int,
+    matrix: Matrix
 ) {
     val viewWidth = textureView.width.toFloat()
     val viewHeight = textureView.height.toFloat()
@@ -625,7 +634,7 @@ private fun applyCenterCropMatrix(
         scaleY = viewAspect / videoAspect
     }
 
-    val matrix = Matrix()
+    matrix.reset()
     matrix.setScale(
         max(0.01f, min(scaleX, 20f)),
         max(0.01f, min(scaleY, 20f)),
@@ -637,6 +646,7 @@ private fun applyCenterCropMatrix(
 
 @Composable
 fun CharacterCircleMediaView(
+    playerManager: StudioExoPlayerManager,
     isCameraActive: Boolean,
     isFrontCamera: Boolean,
     videoFilePath: String?,
@@ -657,8 +667,8 @@ fun CharacterCircleMediaView(
     val currentOnMissingFile by rememberUpdatedState(onMissingVideoFile)
     val currentOnCameraFailure by rememberUpdatedState(onCameraFailure)
 
-    val controller = remember(context.applicationContext) {
-        CharacterCircleMediaController(context.applicationContext)
+    val controller = remember(context.applicationContext, playerManager) {
+        CharacterCircleMediaController(context.applicationContext, playerManager)
     }
 
     val target: CharacterMediaTarget = remember(

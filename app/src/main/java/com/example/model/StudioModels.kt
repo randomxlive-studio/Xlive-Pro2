@@ -122,6 +122,36 @@ data class WindowRectState(
     }
 }
 
+data class BadgeTransformState(
+    val x: Float,
+    val y: Float,
+    val scale: Float
+) {
+    fun clamped(maxX: Float = 0.98f, maxY: Float = 0.98f): BadgeTransformState {
+        return copy(
+            x = x.coerceIn(0f, maxX.coerceAtLeast(0f)),
+            y = y.coerceIn(0f, maxY.coerceAtLeast(0f)),
+            scale = scale.coerceIn(MIN_SCALE, MAX_SCALE)
+        )
+    }
+
+    companion object {
+        const val MIN_SCALE = 0.5f
+        const val MAX_SCALE = 2.5f
+
+        val DefaultPortrait = BadgeTransformState(
+            x = 0.04f,
+            y = 0.025f,
+            scale = 1.0f
+        )
+        val DefaultLandscape = BadgeTransformState(
+            x = 0.025f,
+            y = 0.04f,
+            scale = 1.0f
+        )
+    }
+}
+
 data class ResolvedVideoTarget(
     val originalInput: String,
     val resolvedUrl: String,
@@ -138,6 +168,8 @@ data class ResolvedVideoTarget(
 data class StudioUiState(
     val accountName: String = "RandomXLive",
     val avatarLocalPath: String? = null,
+    val badgePortraitState: BadgeTransformState = BadgeTransformState.DefaultPortrait,
+    val badgeLandscapeState: BadgeTransformState = BadgeTransformState.DefaultLandscape,
 
     // Gameplay media state
     val urlInput: String = "",

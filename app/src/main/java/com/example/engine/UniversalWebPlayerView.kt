@@ -36,6 +36,10 @@ import com.example.model.SniffedStream
 import com.example.model.UserAgentMode
 import com.example.model.VideoQualityPreference
 
+private val SHARED_POSTER_BITMAP: Bitmap by lazy {
+    Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565)
+}
+
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 @Composable
 fun UniversalWebPlayerView(
@@ -82,9 +86,15 @@ fun UniversalWebPlayerView(
     DisposableEffect(Unit) {
         onDispose {
             webViewRef?.apply {
-                stopLoading()
-                loadUrl("about:blank")
-                destroy()
+                runCatching {
+                    stopLoading()
+                    loadUrl("about:blank")
+                    clearHistory()
+                    clearCache(false)
+                    (parent as? ViewGroup)?.removeView(this)
+                    removeAllViews()
+                    destroy()
+                }
             }
             webViewRef = null
         }
@@ -211,8 +221,7 @@ fun UniversalWebPlayerView(
                     private var customView: View? = null
                     private var customCallback: CustomViewCallback? = null
 
-                    override fun getDefaultVideoPoster(): Bitmap =
-                        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                    override fun getDefaultVideoPoster(): Bitmap = SHARED_POSTER_BITMAP
 
                     // Block popup windows / tab hijacks
                     override fun onCreateWindow(

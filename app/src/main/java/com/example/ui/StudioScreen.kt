@@ -21,9 +21,9 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -39,6 +40,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -53,15 +55,25 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -70,16 +82,20 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.min
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.R
 import com.example.engine.ExoVideoPlayerView
+import com.example.engine.StudioExoPlayerManager
 import com.example.engine.UniversalWebPlayerView
-import com.example.model.DisplayScaleMode
+import com.example.model.BadgeTransformState
 import com.example.model.PlaybackEngineMode
 import com.example.model.SniffedStream
 import com.example.model.StudioUiState
@@ -99,6 +115,8 @@ import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioVoid
 import java.io.File
+import kotlin.math.min as kotlinMin
+import kotlin.math.roundToInt
 
 @Composable
 fun StudioScreen(
@@ -224,22 +242,10 @@ fun StudioScreen(
         }
     }
 
-    // Very subtle scale pulse on the circular character/camera view ONLY while AI is speaking
-    val pulseTransition = rememberInfiniteTransition(label = "ai_speech_pulse")
-    val animatedSpeechScale by pulseTransition.animateFloat(
-        initialValue = 1.0f,
-        targetValue = 1.045f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 360, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "circle_speech_scale"
+    // Runs ONLY while AI is actively speaking — zero infinite animation overhead when idle
+    val effectiveCirclePulse = rememberAiSpeechPulseScale(
+        active = state.isAiSpeaking && state.isPulseOnAiSpeakEnabled
     )
-    val effectiveCirclePulse = if (state.isAiSpeaking && state.isPulseOnAiSpeakEnabled) {
-        animatedSpeechScale
-    } else {
-        1.0f
-    }
 
     BoxWithConstraints(
         modifier = modifier
@@ -287,8 +293,8 @@ fun StudioScreen(
                 )
                 .testTag("studio_scene_stage")
         ) {
-            // Animated Neon Cyber Grid Background
-            AnimatedCyberGridBackground(isLandscape = isLandscape)
+            // Cached Neon Cyber Grid Background (zero per-frame shader allocations)
+            StaticCyberGridBackground(isLandscape = isLandscape)
 
             // 1. GAMEPLAY / UNIVERSAL VIDEO WINDOW (#gwin)
             DraggableStudioWindow(
@@ -308,6 +314,7 @@ fun StudioScreen(
                 onRectChange = { rect, save -> viewModel.updateGameplayRect(rect, save) }
             ) {
                 GameplayMediaContent(
+                    playerManager = viewModel.playerManager,
                     state = state,
                     onEmbedBlocked = viewModel::onEmbedBlockedOrFailed,
                     onDirectStreamError = viewModel::onDirectStreamFailed,
@@ -316,17 +323,7 @@ fun StudioScreen(
                 )
             }
 
-            // 2. STREAMER HEADER PILL (#hdr)
-            StreamerHeaderBadge(
-                accountName = state.accountName,
-                avatarPath = state.avatarLocalPath,
-                modifier = Modifier
-                    .windowInsetsPadding(WindowInsets.statusBars)
-                    .padding(start = 14.dp, top = 12.dp)
-            )
-
-            // 3. PERFECT CIRCULAR CHARACTER / LIVE CAMERA WINDOW (#cwin) — rendered above video,
-            // no corners, no border, no stroke, no shadow, draggable & resizable, subtle pulse on AI speech
+            // 2. PERFECT CIRCULAR CHARACTER / LIVE CAMERA WINDOW (#cwin) — rendered above gameplay
             val charRect = if (isLandscape) state.characterLandscapeRect else state.characterPortraitRect
             DraggableStudioWindow(
                 rect = charRect,
@@ -347,6 +344,7 @@ fun StudioScreen(
                 }
             ) {
                 CharacterCircleMediaView(
+                    playerManager = viewModel.playerManager,
                     isCameraActive = state.isCameraActive,
                     isFrontCamera = state.isFrontCamera,
                     videoFilePath = state.characterLocalPath,
@@ -361,6 +359,26 @@ fun StudioScreen(
                     modifier = Modifier.fillMaxSize()
                 )
             }
+
+            // 3. MOVABLE & RESIZABLE STREAMER ACCOUNT BADGE (#hdr) — rendered above video,
+            // 1-finger drag + 2-finger pinch scale (0.5x..2.5x), clamped strictly inside stage bounds
+            val badgeTransform = if (isLandscape) {
+                state.badgeLandscapeState
+            } else {
+                state.badgePortraitState
+            }
+            MovableStreamerHeaderBadge(
+                accountName = state.accountName,
+                avatarPath = state.avatarLocalPath,
+                transform = badgeTransform,
+                isLandscape = isLandscape,
+                isEditMode = !state.isBroadcastMode,
+                stageWidthPx = stageWidthPx,
+                stageHeightPx = stageHeightPx,
+                onTransformChange = { updated, saveNow ->
+                    viewModel.updateBadgeTransform(updated, isLandscape, saveNow)
+                }
+            )
         }
 
         // Floating subtle Broadcast Controls when in Broadcast Mode (#gear & #gear2)
@@ -490,8 +508,9 @@ fun StudioScreen(
                 onTtsSpeedChange = viewModel::updateTtsSpeed,
                 onTtsPitchChange = viewModel::updateTtsPitch,
                 onAiCooldownChange = viewModel::updateAiCooldownSeconds,
-                onResetGameplay = viewModel::resetGameplayWindow,
-                onResetCharacter = { viewModel.resetCharacterWindow(isLandscape) },
+                onResetGameplay = viewModel::resetGameplay,
+                onResetCharacter = viewModel::resetCircle,
+                onResetBadge = viewModel::resetBadge,
                 modifier = Modifier.align(
                     if (isLandscape) Alignment.BottomEnd else Alignment.BottomCenter
                 )
@@ -561,7 +580,24 @@ fun StudioScreen(
 }
 
 @Composable
+private fun rememberAiSpeechPulseScale(active: Boolean): Float {
+    if (!active) return 1.0f
+    val pulseTransition = rememberInfiniteTransition(label = "ai_speech_pulse")
+    val animatedSpeechScale by pulseTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = 1.045f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 360, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "circle_speech_scale"
+    )
+    return animatedSpeechScale
+}
+
+@Composable
 private fun GameplayMediaContent(
+    playerManager: StudioExoPlayerManager,
     state: StudioUiState,
     onEmbedBlocked: (String) -> Unit,
     onDirectStreamError: (String) -> Unit,
@@ -579,17 +615,20 @@ private fun GameplayMediaContent(
             // Case 1: Active Online URL
             state.activeUrl.isNotBlank() && target != null -> {
                 val directUrl = state.selectedSniffedStream?.url ?: target.primaryStreamUrl
-                val directHeaders = if (state.selectedSniffedStream != null) {
-                    mapOf(
-                        "Referer" to state.selectedSniffedStream.referer.ifBlank { target.resolvedUrl },
-                        "User-Agent" to state.selectedSniffedStream.userAgent
-                    )
-                } else {
-                    target.requestHeaders
+                val directHeaders = remember(state.selectedSniffedStream, target) {
+                    if (state.selectedSniffedStream != null) {
+                        mapOf(
+                            "Referer" to state.selectedSniffedStream.referer.ifBlank { target.resolvedUrl },
+                            "User-Agent" to state.selectedSniffedStream.userAgent
+                        )
+                    } else {
+                        target.requestHeaders
+                    }
                 }
 
                 if (effectiveEngine == PlaybackEngineMode.DIRECT_STREAM && !directUrl.isNullOrBlank()) {
                     ExoVideoPlayerView(
+                        playerManager = playerManager,
                         sourceUriOrUrl = directUrl,
                         headers = directHeaders,
                         isPlaying = state.isGameplayPlaying,
@@ -625,6 +664,7 @@ private fun GameplayMediaContent(
             // Case 2: Local Uploaded Gameplay File
             !state.gameplayLocalPath.isNullOrBlank() -> {
                 ExoVideoPlayerView(
+                    playerManager = playerManager,
                     sourceUriOrUrl = state.gameplayLocalPath,
                     headers = emptyMap(),
                     isPlaying = state.isGameplayPlaying,
@@ -646,6 +686,7 @@ private fun GameplayMediaContent(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(16.dp)
+                        .testTag("gameplay_empty_placeholder")
                 ) {
                     Icon(
                         imageVector = Icons.Default.LiveTv,
@@ -688,11 +729,14 @@ private fun GameplayMediaContent(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(
-                        Brush.radialGradient(
+                    .drawWithCache {
+                        val coverBrush = Brush.radialGradient(
                             colors = listOf(Color(0xFF1B0F3D), StudioVoid)
                         )
-                    )
+                        onDrawBehind {
+                            drawRect(coverBrush)
+                        }
+                    }
                     .testTag("be_right_back_cover")
             ) {
                 Text(
@@ -710,156 +754,280 @@ private fun GameplayMediaContent(
 }
 
 @Composable
-private fun StreamerHeaderBadge(
+private fun MovableStreamerHeaderBadge(
     accountName: String,
     avatarPath: String?,
+    transform: BadgeTransformState,
+    isLandscape: Boolean,
+    isEditMode: Boolean,
+    stageWidthPx: Float,
+    stageHeightPx: Float,
+    onTransformChange: (BadgeTransformState, Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "live_pulse")
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0.25f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 750, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_alpha"
+    val context = LocalContext.current
+    val density = LocalDensity.current
+
+    val currentTransform by rememberUpdatedState(transform)
+    val currentOnTransformChange by rememberUpdatedState(onTransformChange)
+
+    val defaultBaseWidthPx = with(density) { 172.dp.toPx() }
+    val defaultBaseHeightPx = with(density) { 50.dp.toPx() }
+    var measuredBaseSize by remember { mutableStateOf(IntSize.Zero) }
+
+    val baseWidthPx = if (measuredBaseSize.width > 0) {
+        measuredBaseSize.width.toFloat()
+    } else {
+        defaultBaseWidthPx
+    }
+    val baseHeightPx = if (measuredBaseSize.height > 0) {
+        measuredBaseSize.height.toFloat()
+    } else {
+        defaultBaseHeightPx
+    }
+
+    // Limit scale between 0.5x and 2.5x while guaranteeing the scaled badge fits inside the stage
+    val maxScaleThatFitsStage = if (stageWidthPx > 1f && stageHeightPx > 1f) {
+        kotlinMin(
+            BadgeTransformState.MAX_SCALE,
+            kotlinMin(stageWidthPx / baseWidthPx, stageHeightPx / baseHeightPx)
+                .coerceAtLeast(BadgeTransformState.MIN_SCALE)
+        )
+    } else {
+        BadgeTransformState.MAX_SCALE
+    }
+
+    val effectiveScale = transform.scale.coerceIn(
+        BadgeTransformState.MIN_SCALE,
+        maxScaleThatFitsStage
     )
 
-    val pillShape = RoundedCornerShape(50)
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier
-            .widthIn(max = 260.dp)
-            .shadow(10.dp, pillShape, spotColor = NeonPurple)
-            .clip(pillShape)
-            .background(
-                Brush.horizontalGradient(
-                    listOf(Color(0xDD0B1430), Color(0xDD1A0B3A))
+    val scaledWidthPx = baseWidthPx * effectiveScale
+    val scaledHeightPx = baseHeightPx * effectiveScale
+
+    val maxOffsetX = (stageWidthPx - scaledWidthPx).coerceAtLeast(0f)
+    val maxOffsetY = (stageHeightPx - scaledHeightPx).coerceAtLeast(0f)
+
+    val clampedXPx = (transform.x * stageWidthPx).coerceIn(0f, maxOffsetX)
+    val clampedYPx = (transform.y * stageHeightPx).coerceIn(0f, maxOffsetY)
+
+    val touchBoxWidthDp = with(density) { scaledWidthPx.coerceAtLeast(48.dp.toPx()).toDp() }
+    val touchBoxHeightDp = with(density) { scaledHeightPx.coerceAtLeast(48.dp.toPx()).toDp() }
+
+    val pillShape = remember { RoundedCornerShape(50) }
+    val pillBrush = remember {
+        Brush.horizontalGradient(listOf(Color(0xDD0B1430), Color(0xDD1A0B3A)))
+    }
+    val avatarModel = remember(context, avatarPath) {
+        val validFile = avatarPath?.takeIf { it.isNotBlank() }?.let(::File)
+        if (validFile != null && validFile.exists()) {
+            ImageRequest.Builder(context)
+                .data(validFile)
+                .size(256)
+                .crossfade(false)
+                .build()
+        } else {
+            null
+        }
+    }
+
+    val gestureModifier = if (isEditMode) {
+        Modifier.pointerInput(isLandscape, stageWidthPx, stageHeightPx, baseWidthPx, baseHeightPx) {
+            if (stageWidthPx <= 1f || stageHeightPx <= 1f) return@pointerInput
+            detectTransformGestures { _, pan, zoom, _ ->
+                val cur = currentTransform
+                val fitCap = kotlinMin(
+                    BadgeTransformState.MAX_SCALE,
+                    kotlinMin(stageWidthPx / baseWidthPx, stageHeightPx / baseHeightPx)
+                        .coerceAtLeast(BadgeTransformState.MIN_SCALE)
                 )
-            )
-            .border(1.5.dp, NeonPurple, pillShape)
-            .padding(start = 6.dp, end = 14.dp, top = 5.dp, bottom = 5.dp)
-            .testTag("streamer_header_badge")
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(38.dp)
-                .clip(CircleShape)
-                .background(Color(0xFF11182E))
-                .border(2.dp, NeonCyan, CircleShape)
-        ) {
-            if (!avatarPath.isNullOrBlank()) {
-                AsyncImage(
-                    model = File(avatarPath),
-                    contentDescription = stringResource(R.string.cd_profile_avatar),
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
+                val prevScale = cur.scale.coerceIn(BadgeTransformState.MIN_SCALE, fitCap)
+                val nextScale = (prevScale * zoom).coerceIn(BadgeTransformState.MIN_SCALE, fitCap)
+
+                val prevXPx = (cur.x * stageWidthPx)
+                    .coerceIn(0f, (stageWidthPx - baseWidthPx * prevScale).coerceAtLeast(0f))
+                val prevYPx = (cur.y * stageHeightPx)
+                    .coerceIn(0f, (stageHeightPx - baseHeightPx * prevScale).coerceAtLeast(0f))
+
+                // Anchor pinch zoom subtly around badge center + apply 1-finger or 2-finger pan
+                val scaleDeltaW = baseWidthPx * (nextScale - prevScale) * 0.5f
+                val scaleDeltaH = baseHeightPx * (nextScale - prevScale) * 0.5f
+
+                val nextMaxX = (stageWidthPx - baseWidthPx * nextScale).coerceAtLeast(0f)
+                val nextMaxY = (stageHeightPx - baseHeightPx * nextScale).coerceAtLeast(0f)
+
+                val nextXPx = (prevXPx + pan.x - scaleDeltaW).coerceIn(0f, nextMaxX)
+                val nextYPx = (prevYPx + pan.y - scaleDeltaH).coerceIn(0f, nextMaxY)
+
+                val updated = BadgeTransformState(
+                    x = (nextXPx / stageWidthPx).coerceIn(0f, 1f),
+                    y = (nextYPx / stageHeightPx).coerceIn(0f, 1f),
+                    scale = nextScale
                 )
-            } else {
-                Icon(
-                    imageVector = Icons.Default.Person,
-                    contentDescription = stringResource(R.string.cd_profile_avatar),
-                    tint = NeonCyan,
-                    modifier = Modifier.size(22.dp)
-                )
+                currentOnTransformChange(updated, false)
             }
         }
+    } else {
+        Modifier
+    }
 
-        Spacer(modifier = Modifier.width(10.dp))
-
-        Column {
-            Text(
-                text = accountName.ifBlank { " " },
-                fontFamily = SpaceGroteskFamily,
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp,
-                color = StudioTextPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .alpha(pulseAlpha)
-                        .clip(CircleShape)
-                        .background(LivePulseRed)
+    Box(
+        modifier = modifier
+            .offset {
+                IntOffset(
+                    x = clampedXPx.roundToInt(),
+                    y = clampedYPx.roundToInt()
                 )
-                Spacer(modifier = Modifier.width(5.dp))
+            }
+            .size(width = touchBoxWidthDp, height = touchBoxHeightDp)
+            .then(gestureModifier)
+            .testTag("streamer_header_badge")
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .wrapContentSize(Alignment.TopStart, unbounded = true)
+                .onSizeChanged { size ->
+                    if (size.width > 0 && size.height > 0 && size != measuredBaseSize) {
+                        measuredBaseSize = size
+                    }
+                }
+                .graphicsLayer {
+                    scaleX = effectiveScale
+                    scaleY = effectiveScale
+                    transformOrigin = TransformOrigin(0f, 0f)
+                    compositingStrategy = CompositingStrategy.Auto
+                }
+                .widthIn(max = 260.dp)
+                .shadow(10.dp, pillShape, spotColor = NeonPurple)
+                .clip(pillShape)
+                .background(pillBrush)
+                .border(1.5.dp, NeonPurple, pillShape)
+                .padding(start = 6.dp, end = 14.dp, top = 5.dp, bottom = 5.dp)
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFF11182E))
+                    .border(2.dp, NeonCyan, CircleShape)
+            ) {
+                if (avatarModel != null) {
+                    AsyncImage(
+                        model = avatarModel,
+                        contentDescription = stringResource(R.string.cd_profile_avatar),
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Person,
+                        contentDescription = stringResource(R.string.cd_profile_avatar),
+                        tint = NeonCyan,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.width(10.dp))
+
+            Column {
                 Text(
-                    text = stringResource(R.string.live_badge),
+                    text = accountName.ifBlank { " " },
                     fontFamily = SpaceGroteskFamily,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 10.sp,
-                    letterSpacing = 1.6.sp,
-                    color = LivePulseRed
+                    fontSize = 16.sp,
+                    color = StudioTextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LivePulseDot()
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = stringResource(R.string.live_badge),
+                        fontFamily = SpaceGroteskFamily,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        letterSpacing = 1.6.sp,
+                        color = LivePulseRed
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-private fun AnimatedCyberGridBackground(isLandscape: Boolean) {
-    val infiniteTransition = rememberInfiniteTransition(label = "cyber_grid")
-    val gridPhase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
+private fun LivePulseDot() {
+    val infiniteTransition = rememberInfiniteTransition(label = "live_pulse")
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.25f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 8000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
+            animation = tween(durationMillis = 850, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
         ),
-        label = "grid_phase"
+        label = "pulse_alpha"
     )
+    Box(
+        modifier = Modifier
+            .size(7.dp)
+            .graphicsLayer { alpha = pulseAlpha }
+            .clip(CircleShape)
+            .background(LivePulseRed)
+    )
+}
 
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(Color(0xFF1B0F3D), Color.Transparent),
-                center = Offset(w * 0.5f, 0f),
-                radius = maxOf(w, h) * 0.65f
-            )
-        )
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(Color(0xFF032A3A), Color.Transparent),
-                center = Offset(w * 0.5f, h),
-                radius = maxOf(w, h) * 0.55f
-            )
-        )
-
-        val cell = (minOf(w, h) * 0.09f).coerceAtLeast(24f)
-        val gridAlpha = if (isLandscape) 0.08f else 0.16f
-        val lineColor = NeonCyan.copy(alpha = gridAlpha)
-
-        var x = 0f
-        while (x <= w) {
-            drawLine(
-                color = lineColor,
-                start = Offset(x, 0f),
-                end = Offset(x, h),
-                strokeWidth = 1f
-            )
-            x += cell
-        }
-
-        val yOffset = gridPhase * cell
-        var y = -cell + yOffset
-        while (y <= h) {
-            if (y >= 0f) {
-                drawLine(
-                    color = lineColor,
-                    start = Offset(0f, y),
-                    end = Offset(w, y),
-                    strokeWidth = 1f
+@Composable
+private fun StaticCyberGridBackground(isLandscape: Boolean) {
+    Spacer(
+        modifier = Modifier
+            .fillMaxSize()
+            .drawWithCache {
+                val w = size.width
+                val h = size.height
+                val topGlow = Brush.radialGradient(
+                    colors = listOf(Color(0xFF1B0F3D), Color.Transparent),
+                    center = Offset(w * 0.5f, 0f),
+                    radius = maxOf(w, h) * 0.65f
                 )
+                val bottomGlow = Brush.radialGradient(
+                    colors = listOf(Color(0xFF032A3A), Color.Transparent),
+                    center = Offset(w * 0.5f, h),
+                    radius = maxOf(w, h) * 0.55f
+                )
+                val cell = (minOf(w, h) * 0.09f).coerceAtLeast(24f)
+                val gridAlpha = if (isLandscape) 0.08f else 0.16f
+                val lineColor = NeonCyan.copy(alpha = gridAlpha)
+
+                onDrawBehind {
+                    drawRect(brush = topGlow)
+                    drawRect(brush = bottomGlow)
+
+                    var x = 0f
+                    while (x <= w) {
+                        drawLine(
+                            color = lineColor,
+                            start = Offset(x, 0f),
+                            end = Offset(x, h),
+                            strokeWidth = 1f
+                        )
+                        x += cell
+                    }
+
+                    var y = 0f
+                    while (y <= h) {
+                        drawLine(
+                            color = lineColor,
+                            start = Offset(0f, y),
+                            end = Offset(w, y),
+                            strokeWidth = 1f
+                        )
+                        y += cell
+                    }
+                }
             }
-            y += cell
-        }
-    }
+    )
 }
