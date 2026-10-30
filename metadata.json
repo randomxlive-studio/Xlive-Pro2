@@ -1,0 +1,8 @@
+{
+  "name": "RandomXLive",
+  "description": "Universal live broadcast studio and overlay app that plays and isolates videos from any platform, direct stream, or local file alongside a live camera or character window.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

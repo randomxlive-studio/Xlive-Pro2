@@ -1,0 +1,159 @@
+<resources>
+    <string name="app_name">RandomXLive</string>
+    <string name="studio_title">RandomXLive Studio</string>
+    <string name="live_badge">LIVE</string>
+    <string name="be_right_back">BE RIGHT BACK</string>
+    <string name="default_account_name">RandomXLive</string>
+
+    <!-- Accessibility Service Metadata -->
+    <string name="accessibility_service_label">RandomXLive TikTok Comment Reader</string>
+    <string name="accessibility_service_description">Reads incoming TikTok LIVE comments on screen so the RandomXLive sarcastic AI voice can answer viewers hands-free.</string>
+
+    <!-- Placeholders & Empty States -->
+    <string name="gameplay_empty_title">Gameplay &amp; Video Window</string>
+    <string name="gameplay_empty_subtitle">Paste a link from any platform, upload a video, or open the built-in browser</string>
+    <string name="character_empty_title">Circle</string>
+    <string name="character_empty_subtitle">Image / Cam</string>
+
+    <!-- Panel Top Bar -->
+    <string name="btn_broadcast_short">Broadcast</string>
+    <string name="btn_start_broadcast">Start Broadcast Mode</string>
+    <string name="btn_hide_panel">Hide panel</string>
+    <string name="btn_show_panel">Show panel</string>
+    <string name="wake_lock_active">Screen stays on: ON ✓  |  Min 720p HD Lock: ACTIVE</string>
+
+    <!-- Account Section -->
+    <string name="section_account">ACCOUNT &amp; TIKTOK HANDLE</string>
+    <string name="hint_account_name">Account / Own TikTok username (ignored in chat)</string>
+    <string name="btn_pick_avatar">Profile picture</string>
+
+    <!-- Universal Video & Link Section -->
+    <string name="section_universal_video">PLAY ANY VIDEO FROM ANY PLATFORM</string>
+    <string name="hint_video_url">Paste YouTube, TikTok, Twitch, Kick, Facebook, Instagram, X, M3U8, MP4, or any site…</string>
+    <string name="btn_paste_url">Paste</string>
+    <string name="btn_load_url">Load link</string>
+    <string name="btn_clear_url">Clear</string>
+    <string name="btn_open_browser">Built-in Platform Browser &amp; Stream Grabber</string>
+    <string name="hint_universal_engine">Forces minimum 720p HD quality, blocks ads across all sites, and extracts direct streams automatically where possible.</string>
+
+    <!-- Quality & Ad Blocker -->
+    <string name="section_quality_adblock">VIDEO QUALITY (MIN 720P LOCK) &amp; AD BLOCKER</string>
+    <string name="quality_auto">Auto (720p+)</string>
+    <string name="quality_1080p">1080p</string>
+    <string name="quality_720p">720p</string>
+    <string name="adblock_on">Ad Blocker: ON</string>
+    <string name="adblock_off">Ad Blocker: OFF</string>
+
+    <!-- Engine Modes -->
+    <string name="section_engine_mode">PLAYBACK ENGINE (SWITCH IF A SITE BLOCKS EMBEDS)</string>
+    <string name="engine_auto">Smart Auto</string>
+    <string name="engine_isolator">Video Isolator</string>
+    <string name="engine_embed">Platform Embed</string>
+    <string name="engine_direct">Direct Stream</string>
+    <string name="engine_interactive">Interactive Touch</string>
+    <string name="btn_lock_isolate_now">Lock &amp; Isolate Video Now</string>
+    <string name="ua_mobile">Mobile Mode</string>
+    <string name="ua_desktop">Desktop Mode</string>
+    <string name="sniffed_streams_title">Detected Direct Streams (%1$d) — tap to play in ExoPlayer (720p+):</string>
+
+    <!-- Gameplay Controls -->
+    <string name="section_gameplay_controls">GAMEPLAY VIDEO CONTROLS</string>
+    <string name="btn_upload_gameplay">Upload gameplay</string>
+    <string name="btn_play">Play</string>
+    <string name="btn_pause">Pause</string>
+    <string name="btn_sound_on">Sound: on</string>
+    <string name="btn_sound_off">Sound: off</string>
+    <string name="btn_reload_player">Reload</string>
+    <string name="btn_auto_hide_ads_on">Auto-hide ads: on</string>
+    <string name="btn_auto_hide_ads_off">Auto-hide ads: off</string>
+    <string name="btn_cover_show">Show video</string>
+    <string name="btn_cover_hide">Hide video now</string>
+    <string name="btn_voice_reduce_on">Reduce voice: on</string>
+    <string name="btn_voice_reduce_off">Reduce voice: off</string>
+    <string name="hint_voice_reduce">Reduce voice cancels center-channel vocals in uploaded files and direct/extracted streams.</string>
+
+    <!-- Display & Aspect Ratio -->
+    <string name="section_display_mode">DISPLAY MODE</string>
+    <string name="mode_fit">Fit</string>
+    <string name="mode_fill">Fill</string>
+    <string name="mode_stretch">Stretch</string>
+    <string name="section_aspect_ratio">GAMEPLAY FRAME</string>
+    <string name="ratio_landscape">Landscape 16:9</string>
+    <string name="ratio_portrait">Portrait 9:16</string>
+    <string name="ratio_free">Free</string>
+
+    <!-- Circular Character & Camera -->
+    <string name="section_character">CIRCULAR CHARACTER / CAMERA</string>
+    <string name="btn_upload_character">Upload image/video</string>
+    <string name="btn_camera_on">Camera on: tap for media</string>
+    <string name="btn_camera_off">Use camera</string>
+    <string name="btn_camera_flip">Flip camera</string>
+    <string name="btn_pulse_on">AI Speech Pulse: ON</string>
+    <string name="btn_pulse_off">AI Speech Pulse: OFF</string>
+    <string name="camera_permission_denied">Please allow camera permission to use live camera in the character circle.</string>
+
+    <!-- TikTok LIVE Reader & Sarcastic AI Voice -->
+    <string name="section_tiktok_ai">TIKTOK LIVE READER &amp; SARCASTIC AI VOICE (AUDIO ONLY)</string>
+    <string name="btn_reader_running">Stop Comment Reader</string>
+    <string name="btn_reader_stopped">Start Comment Reader</string>
+    <string name="btn_setup_permissions">Setup Guide &amp; Permissions</string>
+    <string name="btn_ocr_fallback_on">OCR Fallback: ON</string>
+    <string name="btn_ocr_fallback_off">Enable OCR Fallback</string>
+    <string name="ai_status_summary">Accessibility: %1$s  •  Queue: %2$d/3  •  Today: %3$d reqs</string>
+    <string name="status_ready">Ready</string>
+    <string name="status_off">Off</string>
+    <string name="btn_ai_on">AI Replies: ON</string>
+    <string name="btn_ai_off">AI Replies: OFF</string>
+    <string name="btn_tts_on">Voice TTS: ON</string>
+    <string name="btn_tts_off">Voice TTS: OFF</string>
+    <string name="provider_gemini">Gemini Free</string>
+    <string name="provider_groq">Groq Free</string>
+    <string name="hint_api_key">Enter free %1$s API Key (saved locally only)</string>
+    <string name="btn_preview_voice">Preview Voice</string>
+    <string name="voice_auto_match">Auto-match comment language</string>
+    <string name="label_tts_voice">TTS Voice: %1$s</string>
+    <string name="label_tts_speed">Voice Speed: %1$.2fx</string>
+    <string name="label_tts_pitch">Voice Pitch: %1$.2fx</string>
+    <string name="label_ai_cooldown">Reply Cooldown: %1$ds</string>
+    <string name="tts_preview_sample">Oh wow, another genius comment in my live stream. Welcome aboard!</string>
+
+    <!-- Setup Guide Modal -->
+    <string name="setup_guide_title">TikTok Comment Reader Setup</string>
+    <string name="setup_step_accessibility_title">1. Enable Accessibility Service (Primary)</string>
+    <string name="setup_step_accessibility_desc">Tap Open Accessibility Settings, find \"RandomXLive TikTok Comment Reader\" under Installed Apps, and switch it ON. It only reads com.zhiliaoapp.musically &amp; com.ss.android.ugc.trill.</string>
+    <string name="btn_open_accessibility">Open Accessibility Settings</string>
+    <string name="setup_step_overlay_title">2. Grant Overlay Permission</string>
+    <string name="setup_step_overlay_desc">Allows seamless background operation alongside TikTok LIVE (no text bubbles are ever drawn on screen).</string>
+    <string name="btn_open_overlay">Open Overlay Settings</string>
+    <string name="setup_step_ocr_title">3. Screen OCR Fallback (Optional)</string>
+    <string name="setup_step_ocr_desc">Only used if TikTok hides accessibility comment nodes. Captures the comment region every 2.5s using free offline ML Kit OCR.</string>
+    <string name="btn_close">Done</string>
+
+    <!-- Reset & Tips -->
+    <string name="section_reset">RESET</string>
+    <string name="btn_reset_gameplay">Reset gameplay</string>
+    <string name="btn_reset_character">Reset circle</string>
+    <string name="hint_drag_resize">Rotate sideways for full-screen gameplay while the header and circular character stay above the video. Drag or pinch to move and resize.</string>
+
+    <!-- Broadcast Floating Controls & Accessibility -->
+    <string name="cd_exit_broadcast">Back to editing</string>
+    <string name="cd_toggle_cover">Hide or show video cover</string>
+    <string name="cd_profile_avatar">Profile avatar</string>
+    <string name="cd_close_browser">Close browser</string>
+
+    <!-- Built-in Platform Browser Sheet -->
+    <string name="browser_sheet_title">Platform Browser &amp; Video Grabber</string>
+    <string name="browser_url_hint">Search for a video or enter any website URL…</string>
+    <string name="browser_go">Go</string>
+    <string name="browser_use_page_isolated">Send &amp; Isolate Page Video in Studio</string>
+    <string name="browser_use_sniffed_stream">Play Detected Direct Stream (%1$d)</string>
+    <string name="browser_tip">Browse any platform, sign in if needed, or start playing a video — then tap below to load it directly into your Studio window.</string>
+
+    <!-- Status Messages -->
+    <string name="status_resolving">Resolving link and selecting 720p+ playback engine…</string>
+    <string name="status_loaded_platform">Video ready (%1$s)</string>
+    <string name="status_fallback_isolator">Switched automatically to Universal Video Isolator to bypass embed restrictions</string>
+    <string name="status_saved_local">Saved on this device</string>
+    <string name="status_invalid_url">Please enter a valid link starting with https:// or search keywords</string>
+    <string name="status_clipboard_empty">Clipboard is empty</string>
+</resources>
