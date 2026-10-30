@@ -23,34 +23,45 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Configure Android SDK & Licenses
+      - name: Configure Android SDK 36.1 & Licenses
         run: |
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          sudo mkdir -p "$SDK_ROOT"
-          sudo chmod -R a+rwx "$SDK_ROOT"
+          sudo mkdir -p "$SDK_ROOT/licenses" "$SDK_ROOT/platforms" "$SDK_ROOT/build-tools" "$SDK_ROOT/platform-tools" "$SDK_ROOT/cmdline-tools"
+          sudo chmod 777 "$SDK_ROOT"
+          sudo chown -R "$(id -u):$(id -g)" "$SDK_ROOT/licenses" "$SDK_ROOT/platforms" "$SDK_ROOT/build-tools" "$SDK_ROOT/platform-tools" "$SDK_ROOT/cmdline-tools"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
 
-          SDKMANAGER=$(find "$SDK_ROOT" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)
-          if [ -z "$SDKMANAGER" ]; then
-            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
-            mkdir -p "$SDK_ROOT/cmdline-tools"
-            unzip -q /tmp/cmdtools.zip -d "$SDK_ROOT/cmdline-tools"
-            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
-            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          rm -rf /tmp/bootstrap-cmdtools
+          if [ -d "$SDK_ROOT/cmdline-tools/latest" ]; then
+            mv "$SDK_ROOT/cmdline-tools/latest" /tmp/bootstrap-cmdtools
+          else
+            EXISTING_CMD=$(ls -1d "$SDK_ROOT"/cmdline-tools/* 2>/dev/null | head -n 1 || true)
+            if [ -n "$EXISTING_CMD" ] && [ -x "$EXISTING_CMD/bin/sdkmanager" ]; then
+              cp -r "$EXISTING_CMD" /tmp/bootstrap-cmdtools
+            else
+              curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
+              unzip -q /tmp/cmdtools.zip -d /tmp
+              mv /tmp/cmdline-tools /tmp/bootstrap-cmdtools
+            fi
           fi
+          chmod +x /tmp/bootstrap-cmdtools/bin/sdkmanager
+
+          set +o pipefail
+          yes | /tmp/bootstrap-cmdtools/bin/sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          set -o pipefail
+
+          /tmp/bootstrap-cmdtools/bin/sdkmanager --sdk_root="$SDK_ROOT" --install "cmdline-tools;latest"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           chmod +x "$SDKMANAGER"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --version
 
-          mkdir -p "$SDK_ROOT/licenses"
-          printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" > "$SDK_ROOT/licenses/android-sdk-license"
-          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > "$SDK_ROOT/licenses/android-sdk-preview-license"
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          set -o pipefail
 
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platform-tools" || true
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "build-tools;36.0.0" || true
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-36" || true
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-36.1" || true
-          sudo chmod -R a+rwx "$SDK_ROOT"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platform-tools" "build-tools;36.0.0" "platforms;android-36"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-36.1"
 
       - name: Install Gradle 9.3.1
         run: |
@@ -62,6 +73,7 @@ jobs:
 
       - name: Build Debug APK
         run: |
+          set -o pipefail
           if [ ! -f .env ]; then
             cp .env.example .env 2>/dev/null || touch .env
           fi
@@ -70,11 +82,23 @@ jobs:
           elif [ ! -f debug.keystore ]; then
             keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
-          gradle assembleDebug --no-daemon --no-configuration-cache --stacktrace
+          /opt/gradle-dist/gradle-9.3.1/bin/gradle assembleDebug --no-daemon --no-configuration-cache --stacktrace 2>&1 | tee gradle-build.log
           APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
           test -n "$APK_PATH"
           cp "$APK_PATH" RandomXLive.apk
           ls -lh RandomXLive.apk
+
+      - name: Print Build Error Summary on Failure
+        if: failure()
+        run: |
+          echo "### ❌ ملخص خطأ البناء (Build Failure Log)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f gradle-build.log ]; then
+            tail -n 80 gradle-build.log >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Failed before Gradle step — check failed step above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish Direct Download APK to GitHub Releases
         env:
